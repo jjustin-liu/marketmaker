@@ -27,7 +27,15 @@ from typing import List
 import pandas as pd
 import websockets
 
-WS_BASE = "wss://stream.binance.com:9443/stream"
+# Public market-data mirrors. VISION is US-accessible; GLOBAL is geoblocked
+# from the US (HTTP 451). Match the regions table in binance_ws.py.
+WS_BASES = {
+    "GLOBAL": "wss://stream.binance.com:9443/stream",
+    "VISION": "wss://data-stream.binance.vision/stream",
+    "US": "wss://stream.binance.us:9443/stream",
+    "TEST": "wss://stream.testnet.binance.vision/stream",
+}
+DEFAULT_REGION = "VISION"
 
 logger = logging.getLogger("recorder")
 
@@ -88,9 +96,12 @@ async def record(
     out_dir: Path,
     duration_sec: float | None,
     flush_rows: int,
+    region: str,
 ) -> None:
+    if region not in WS_BASES:
+        raise ValueError(f"unknown region {region!r}; pick from {list(WS_BASES)}")
     rotator = ParquetRotator(out_dir, symbol)
-    stream_url = f"{WS_BASE}?streams={symbol}@depth"
+    stream_url = f"{WS_BASES[region]}?streams={symbol}@depth"
 
     stop = asyncio.Event()
 
@@ -144,13 +155,18 @@ def main() -> None:
     parser.add_argument("--hours", type=float, default=None,
                         help="record for this many hours; default = forever")
     parser.add_argument("--flush-rows", type=int, default=10_000)
+    parser.add_argument("--region", default=DEFAULT_REGION,
+                        choices=list(WS_BASES),
+                        help="endpoint set; VISION is US-accessible")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     duration = args.hours * 3600 if args.hours else None
 
     try:
-        asyncio.run(record(args.symbol, args.out, duration, args.flush_rows))
+        asyncio.run(record(
+            args.symbol, args.out, duration, args.flush_rows, args.region,
+        ))
     except KeyboardInterrupt:
         sys.exit(0)
 
