@@ -6,7 +6,8 @@ LIMIT orders to testnet.binance.vision and learns about fills by
 polling /api/v3/myTrades. Quotes are still computed by the local EV
 strategy from the Redis book the data feed publishes.
 
-Cancel-and-repost on every tick (no hysteresis). See BACKLOG.md.
+Leaves quotes resting until the strategy target moves far enough to
+justify a cancel/replace.
 """
 
 from __future__ import annotations
@@ -23,11 +24,14 @@ from src.live.binance_gateway import BinanceGateway, BinanceGatewayError
 from src.live.metrics import record_fill, record_quote_refresh, set_position
 from src.live.order_manager import StrategyProtocol
 from src.live.risk_guard import RiskGuard
+from src.strategy.naive_maker import Quote
 
 logger = logging.getLogger("testnet_engine")
 
 DEFAULT_POLL_SECONDS = 0.5
 DEFAULT_FILLS_LOG = Path("data/fills.log")
+BPS = 1e-4
+DEFAULT_REQUOTE_THRESHOLD_BPS = 0.5
 
 
 @dataclass
@@ -37,6 +41,8 @@ class EngineState:
     pnl: float = 0.0
     current_bid_order_id: Optional[int] = None
     current_ask_order_id: Optional[int] = None
+    current_bid_quote: Optional[Quote] = None
+    current_ask_quote: Optional[Quote] = None
     last_trade_id: Optional[int] = None
     fills: List[dict] = field(default_factory=list)
 
@@ -56,6 +62,7 @@ class TestnetEngine:
         symbol: str = "BTCUSDT",
         poll_seconds: float = DEFAULT_POLL_SECONDS,
         fills_log_path: Path = DEFAULT_FILLS_LOG,
+        requote_threshold_bps: float = DEFAULT_REQUOTE_THRESHOLD_BPS,
     ) -> None:
         self._redis = redis_client
         self._gateway = gateway
@@ -64,6 +71,9 @@ class TestnetEngine:
         self._symbol = symbol.upper()
         self._poll_seconds = poll_seconds
         self._fills_log_path = fills_log_path
+        if requote_threshold_bps < 0:
+            raise ValueError("requote_threshold_bps must be nonnegative")
+        self._requote_threshold_bps = requote_threshold_bps
         self.state = EngineState()
         self._fills_log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -100,11 +110,8 @@ class TestnetEngine:
             await self._cancel_open_orders()
             return False
 
-        await self._cancel_open_orders()
-        await self._place_orders(bid_q.price, bid_q.size,
-                                 ask_q.price, ask_q.size)
-        self._publish_quotes(bid_q.price, bid_q.size,
-                             ask_q.price, ask_q.size)
+        await self._refresh_orders_if_needed(bid_q, ask_q, mid)
+        self._publish_current_quotes()
         self._publish_position()
         record_quote_refresh()
         set_position(self.state.inventory, self.state.pnl)
@@ -145,13 +152,24 @@ class TestnetEngine:
         asks = [(float(p), float(q)) for p, q in json.loads(asks_raw)]
         return best_bid, best_ask, bids, asks
 
-    def _publish_quotes(self, bid_p: float, bid_s: float,
-                        ask_p: float, ask_s: float) -> None:
+    def _publish_current_quotes(self) -> None:
         pipe = self._redis.pipeline()
-        pipe.set("strategy:target_bid",
-                 json.dumps({"price": bid_p, "size": bid_s}))
-        pipe.set("strategy:target_ask",
-                 json.dumps({"price": ask_p, "size": ask_s}))
+        if self.state.current_bid_quote is not None:
+            pipe.set(
+                "strategy:target_bid",
+                json.dumps({
+                    "price": self.state.current_bid_quote.price,
+                    "size": self.state.current_bid_quote.size,
+                }),
+            )
+        if self.state.current_ask_quote is not None:
+            pipe.set(
+                "strategy:target_ask",
+                json.dumps({
+                    "price": self.state.current_ask_quote.price,
+                    "size": self.state.current_ask_quote.size,
+                }),
+            )
         pipe.execute()
 
     def _publish_position(self) -> None:
@@ -162,25 +180,61 @@ class TestnetEngine:
 
     # ---- exchange I/O ----
 
+    async def _refresh_orders_if_needed(
+        self, target_bid: Quote, target_ask: Quote, mid: float,
+    ) -> None:
+        threshold = self._requote_threshold_bps * BPS * mid
+        replace_bid = self._should_replace(
+            self.state.current_bid_quote, target_bid, threshold,
+        )
+        replace_ask = self._should_replace(
+            self.state.current_ask_quote, target_ask, threshold,
+        )
+        if replace_bid and self.state.current_bid_order_id is not None:
+            await self._cancel_order("current_bid_order_id")
+        if replace_ask and self.state.current_ask_order_id is not None:
+            await self._cancel_order("current_ask_order_id")
+        if replace_bid:
+            await self._place_bid(target_bid.price, target_bid.size)
+        if replace_ask:
+            await self._place_ask(target_ask.price, target_ask.size)
+
+    @staticmethod
+    def _should_replace(
+        current: Optional[Quote], target: Quote, threshold: float,
+    ) -> bool:
+        if current is None:
+            return True
+        if current.size != target.size:
+            return True
+        return abs(current.price - target.price) > threshold
+
     async def _place_orders(self, bid_price: float, bid_size: float,
                             ask_price: float, ask_size: float) -> None:
+        await self._place_bid(bid_price, bid_size)
+        await self._place_ask(ask_price, ask_size)
+
+    async def _place_bid(self, bid_price: float, bid_size: float) -> None:
         try:
             bid_ack = await self._gateway.post_order(
                 symbol=self._symbol, side="BUY", order_type="LIMIT",
                 quantity=bid_size, price=bid_price,
             )
             self.state.current_bid_order_id = int(bid_ack["orderId"])
+            self.state.current_bid_quote = Quote(bid_price, bid_size)
             logger.info("placed bid %s @ %.2f size %.6f",
                         self.state.current_bid_order_id, bid_price, bid_size)
         except BinanceGatewayError as exc:
             logger.warning("bid place failed: %s", exc)
 
+    async def _place_ask(self, ask_price: float, ask_size: float) -> None:
         try:
             ask_ack = await self._gateway.post_order(
                 symbol=self._symbol, side="SELL", order_type="LIMIT",
                 quantity=ask_size, price=ask_price,
             )
             self.state.current_ask_order_id = int(ask_ack["orderId"])
+            self.state.current_ask_quote = Quote(ask_price, ask_size)
             logger.info("placed ask %s @ %.2f size %.6f",
                         self.state.current_ask_order_id, ask_price, ask_size)
         except BinanceGatewayError as exc:
@@ -188,15 +242,24 @@ class TestnetEngine:
 
     async def _cancel_open_orders(self) -> None:
         for attr in ("current_bid_order_id", "current_ask_order_id"):
-            oid = getattr(self.state, attr)
-            if oid is None:
-                continue
-            try:
-                await self._gateway.cancel_order(self._symbol, order_id=oid)
-                logger.info("cancelled order %s", oid)
-            except BinanceGatewayError as exc:
-                logger.info("cancel %s skipped: %s", oid, exc)
-            setattr(self.state, attr, None)
+            await self._cancel_order(attr)
+
+    async def _cancel_order(self, order_id_attr: str) -> None:
+        oid = getattr(self.state, order_id_attr)
+        if oid is None:
+            return
+        try:
+            await self._gateway.cancel_order(self._symbol, order_id=oid)
+            logger.info("cancelled order %s", oid)
+        except BinanceGatewayError as exc:
+            logger.info("cancel %s skipped: %s", oid, exc)
+        setattr(self.state, order_id_attr, None)
+        quote_attr = (
+            "current_bid_quote"
+            if order_id_attr == "current_bid_order_id"
+            else "current_ask_quote"
+        )
+        setattr(self.state, quote_attr, None)
 
     async def _poll_fills(self, mid: float) -> None:
         try:

@@ -69,6 +69,20 @@ class StubStrategy:
         return self._bid, self._ask
 
 
+class SequenceStrategy:
+    def __init__(self, quotes: List[Tuple[float, float]],
+                 size: float = 0.001) -> None:
+        self._quotes = quotes
+        self._size = size
+        self._idx = 0
+
+    def quote_prices(self, **_kwargs: Any) -> Tuple[Quote, Quote]:
+        i = min(self._idx, len(self._quotes) - 1)
+        self._idx += 1
+        bid, ask = self._quotes[i]
+        return Quote(bid, self._size), Quote(ask, self._size)
+
+
 def _seed_book(redis: FakeRedis, best_bid: float, best_ask: float) -> None:
     redis.set("lob:best_bid", best_bid)
     redis.set("lob:best_ask", best_ask)
@@ -175,6 +189,63 @@ def test_paper_inventory_updates_after_fill(tmp_path: Path) -> None:
     assert mgr.state.inventory == pytest.approx(0.01)
     assert mgr.state.cash == pytest.approx(-100.5 * 0.01)
     assert r.store["position:inventory"] == str(0.01)
+
+
+def test_paper_fill_applies_signed_fee_bps(tmp_path: Path) -> None:
+    r = FakeRedis()
+    _seed_book(r, best_bid=100.0, best_ask=101.0)
+    mgr = OrderManager(
+        redis_client=r,
+        strategy=StubStrategy(bid_price=100.5, ask_price=101.5, size=0.01),
+        risk_guard=RiskGuard(RiskConfig(max_position=1.0, max_drawdown=1e9)),
+        fills_log_path=tmp_path / "fills.log",
+        fee_bps=1.0,
+    )
+    mgr.step()
+    _seed_book(r, best_bid=99.0, best_ask=100.4)
+    mgr.step()
+
+    notional = 100.5 * 0.01
+    assert mgr.state.cash == pytest.approx(-notional - 0.0001 * notional)
+    assert mgr.state.fills[0]["fee"] == pytest.approx(0.0001 * notional)
+
+
+def test_paper_quotes_persist_inside_requote_threshold(tmp_path: Path) -> None:
+    r = FakeRedis()
+    _seed_book(r, best_bid=100.0, best_ask=101.0)
+    mgr = OrderManager(
+        redis_client=r,
+        strategy=SequenceStrategy([(100.50, 101.50), (100.504, 101.496)]),
+        risk_guard=RiskGuard(),
+        fills_log_path=tmp_path / "fills.log",
+        requote_threshold_bps=1.0,
+    )
+    mgr.step()
+    mgr.step()
+
+    bid_obj = json.loads(r.store["strategy:target_bid"])
+    ask_obj = json.loads(r.store["strategy:target_ask"])
+    assert bid_obj["price"] == pytest.approx(100.50)
+    assert ask_obj["price"] == pytest.approx(101.50)
+
+
+def test_paper_quotes_replace_outside_requote_threshold(tmp_path: Path) -> None:
+    r = FakeRedis()
+    _seed_book(r, best_bid=100.0, best_ask=101.0)
+    mgr = OrderManager(
+        redis_client=r,
+        strategy=SequenceStrategy([(100.50, 101.50), (100.60, 101.40)]),
+        risk_guard=RiskGuard(),
+        fills_log_path=tmp_path / "fills.log",
+        requote_threshold_bps=1.0,
+    )
+    mgr.step()
+    mgr.step()
+
+    bid_obj = json.loads(r.store["strategy:target_bid"])
+    ask_obj = json.loads(r.store["strategy:target_ask"])
+    assert bid_obj["price"] == pytest.approx(100.60)
+    assert ask_obj["price"] == pytest.approx(101.40)
 
 
 def test_risk_halt_stops_loop(tmp_path: Path) -> None:

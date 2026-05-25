@@ -30,9 +30,11 @@ import pandas as pd
 from src.lob.order_book import OrderBook, Side
 from src.models.fill_prob import DEFAULT_MODEL_PATH, FillProbabilityModel
 
+BPS = 1e-4
 LOOKAHEAD_DEFAULT = 50
 SAMPLES_PER_TICK = 4  # 2 buy + 2 sell candidates per sampled tick
 TICK_SAMPLE_STRIDE = 5  # only sample 1 in N ticks for training (decorrelate)
+MAX_OFFSET_BPS_DEFAULT = 50.0
 
 logger = logging.getLogger("train_lookahead")
 
@@ -90,7 +92,10 @@ def build_fills_dataset(
     parquet_path: Path,
     lookahead: int,
     max_ticks: int,
+    max_offset_bps: float = MAX_OFFSET_BPS_DEFAULT,
 ) -> pd.DataFrame:
+    if max_offset_bps <= 0:
+        raise ValueError("max_offset_bps must be positive")
     raw = pd.read_parquet(parquet_path)
     logger.info("loaded %d raw rows", len(raw))
 
@@ -113,6 +118,8 @@ def build_fills_dataset(
         spread = asks[0][0] - bids[0][0]
         if spread <= 0:
             continue
+        min_offset = spread * 0.1
+        max_offset = max(min_offset, mid_i * max_offset_bps * BPS)
 
         future_best_asks = [
             asks_seq[j][0][0] for j in range(i + 1, i + 1 + lookahead)
@@ -126,7 +133,9 @@ def build_fills_dataset(
             continue
 
         for _ in range(SAMPLES_PER_TICK // 2):
-            offset = spread * rng.uniform(0.1, 2.0)
+            offset = float(
+                np.exp(rng.uniform(np.log(min_offset), np.log(max_offset)))
+            )
             for side, candidate in (
                 ("buy", mid_i - offset),
                 ("sell", mid_i + offset),
@@ -197,13 +206,21 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--lookahead", type=int, default=LOOKAHEAD_DEFAULT)
     parser.add_argument("--max-ticks", type=int, default=50_000)
+    parser.add_argument(
+        "--max-offset-bps",
+        type=float,
+        default=MAX_OFFSET_BPS_DEFAULT,
+        help="widest candidate distance from mid, in bps; default matches EV",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     if not args.input.exists():
         raise SystemExit(f"input not found: {args.input}")
 
-    df = build_fills_dataset(args.input, args.lookahead, args.max_ticks)
+    df = build_fills_dataset(
+        args.input, args.lookahead, args.max_ticks, args.max_offset_bps,
+    )
     model, auc = train_from_labeled(df)
     logger.info("test AUC = %.4f", auc)
     out = model.save(args.out)

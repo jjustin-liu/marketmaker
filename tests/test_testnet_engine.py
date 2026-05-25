@@ -93,6 +93,20 @@ class StubStrategy:
         return self._bid, self._ask
 
 
+class SequenceStrategy:
+    def __init__(self, quotes: List[Tuple[float, float]],
+                 size: float = 0.001) -> None:
+        self._quotes = quotes
+        self._size = size
+        self._idx = 0
+
+    def quote_prices(self, **_: Any) -> Tuple[Quote, Quote]:
+        i = min(self._idx, len(self._quotes) - 1)
+        self._idx += 1
+        bid, ask = self._quotes[i]
+        return Quote(bid, self._size), Quote(ask, self._size)
+
+
 def _seed_book(r: FakeRedis, best_bid: float, best_ask: float) -> None:
     r.set("lob:best_bid", best_bid)
     r.set("lob:best_ask", best_ask)
@@ -144,7 +158,7 @@ def test_step_skips_when_book_empty(tmp_path: Path) -> None:
     assert gw.posts == []
 
 
-def test_second_step_cancels_previous_orders(tmp_path: Path) -> None:
+def test_second_step_keeps_orders_inside_requote_threshold(tmp_path: Path) -> None:
     r = FakeRedis()
     _seed_book(r, 100.0, 101.0)
     gw = FakeGateway()
@@ -152,8 +166,28 @@ def test_second_step_cancels_previous_orders(tmp_path: Path) -> None:
                        tmp_path=tmp_path)
     _run(eng.step())
     _run(eng.step())
-    assert len(gw.cancels) == 2     # one bid, one ask cancelled
-    assert len(gw.posts) == 4       # two ticks × two sides
+    assert gw.cancels == []
+    assert len(gw.posts) == 2
+
+
+def test_second_step_replaces_orders_outside_requote_threshold(
+    tmp_path: Path,
+) -> None:
+    r = FakeRedis()
+    _seed_book(r, 100.0, 101.0)
+    gw = FakeGateway()
+    eng = TestnetEngine(
+        redis_client=r,
+        gateway=gw,
+        strategy=SequenceStrategy([(100.5, 101.5), (100.7, 101.3)]),
+        risk_guard=RiskGuard(RiskConfig(max_position=1.0, max_drawdown=1e9)),
+        fills_log_path=tmp_path / "fills.log",
+        requote_threshold_bps=1.0,
+    )
+    _run(eng.step())
+    _run(eng.step())
+    assert len(gw.cancels) == 2
+    assert len(gw.posts) == 4
 
 
 def test_buy_fill_updates_inventory(tmp_path: Path) -> None:

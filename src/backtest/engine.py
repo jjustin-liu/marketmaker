@@ -28,6 +28,7 @@ from src.strategy.naive_maker import Quote
 
 BPS = 1e-4
 SIDES_PER_REFRESH = 2
+DEPTH_LEVELS_FOR_STRATEGY = 5
 
 
 class QuoteStrategy(Protocol):
@@ -178,8 +179,8 @@ class BacktestEngine:
                 bid_q, ask_q = self.strategy.quote_prices(
                     mid_price=mid,
                     inventory=self.inventory,
-                    bid_probability=0.5,
-                    ask_probability=0.5,
+                    bids=self.book.depth(Side.BUY, DEPTH_LEVELS_FOR_STRATEGY),
+                    asks=self.book.depth(Side.SELL, DEPTH_LEVELS_FOR_STRATEGY),
                 )
             else:
                 bid_q, ask_q = self.strategy.quote_prices(

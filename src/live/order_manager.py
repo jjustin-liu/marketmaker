@@ -27,6 +27,8 @@ logger = logging.getLogger("order_manager")
 
 DEFAULT_POLL_SECONDS = 0.1
 DEFAULT_FILLS_LOG = Path("data/fills.log")
+BPS = 1e-4
+DEFAULT_REQUOTE_THRESHOLD_BPS = 0.5
 
 
 class StrategyProtocol(Protocol):
@@ -59,12 +61,18 @@ class OrderManager:
         *,
         poll_seconds: float = DEFAULT_POLL_SECONDS,
         fills_log_path: Path = DEFAULT_FILLS_LOG,
+        fee_bps: float = 0.0,
+        requote_threshold_bps: float = DEFAULT_REQUOTE_THRESHOLD_BPS,
     ) -> None:
         self._redis = redis_client
         self._strategy = strategy
         self._risk = risk_guard
         self._poll_seconds = poll_seconds
         self._fills_log_path = fills_log_path
+        if requote_threshold_bps < 0:
+            raise ValueError("requote_threshold_bps must be nonnegative")
+        self._fee_bps = fee_bps
+        self._requote_threshold_bps = requote_threshold_bps
         self.state = ManagerState()
         self._fills_log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -101,9 +109,8 @@ class OrderManager:
             self._cancel_all()
             return False
 
-        self.state.open_bid = bid_q
-        self.state.open_ask = ask_q
-        self._publish_quotes(bid_q, ask_q)
+        self._refresh_quotes_if_needed(bid_q, ask_q, mid)
+        self._publish_open_quotes()
         self._publish_position()
         record_quote_refresh()
         set_position(self.state.inventory, self.state.pnl)
@@ -166,11 +173,14 @@ class OrderManager:
         else:
             s.inventory -= size
             s.cash += notional
+        fee = self._fee_bps * BPS * notional
+        s.cash -= fee
         fill = {
             "ts": time.time(),
             "side": side,
             "price": price,
             "size": size,
+            "fee": fee,
             "mid_at_fill": mid_at_fill,
             "inventory_after": s.inventory,
         }
@@ -184,12 +194,35 @@ class OrderManager:
     def _mark_to_market(self, mid: float) -> None:
         self.state.pnl = self.state.cash + self.state.inventory * mid
 
-    def _publish_quotes(self, bid: Quote, ask: Quote) -> None:
+    def _refresh_quotes_if_needed(
+        self, target_bid: Quote, target_ask: Quote, mid: float,
+    ) -> None:
+        threshold = self._requote_threshold_bps * BPS * mid
+        if self._should_replace(self.state.open_bid, target_bid, threshold):
+            self.state.open_bid = target_bid
+        if self._should_replace(self.state.open_ask, target_ask, threshold):
+            self.state.open_ask = target_ask
+
+    @staticmethod
+    def _should_replace(
+        current: Optional[Quote], target: Quote, threshold: float,
+    ) -> bool:
+        if current is None:
+            return True
+        if current.size != target.size:
+            return True
+        return abs(current.price - target.price) > threshold
+
+    def _publish_open_quotes(self) -> None:
         pipe = self._redis.pipeline()
-        pipe.set("strategy:target_bid",
-                 json.dumps({"price": bid.price, "size": bid.size}))
-        pipe.set("strategy:target_ask",
-                 json.dumps({"price": ask.price, "size": ask.size}))
+        if self.state.open_bid is not None:
+            pipe.set("strategy:target_bid",
+                     json.dumps({"price": self.state.open_bid.price,
+                                 "size": self.state.open_bid.size}))
+        if self.state.open_ask is not None:
+            pipe.set("strategy:target_ask",
+                     json.dumps({"price": self.state.open_ask.price,
+                                 "size": self.state.open_ask.size}))
         pipe.execute()
 
     def _publish_position(self) -> None:
