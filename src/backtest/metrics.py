@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 ANNUALIZATION_FACTOR = math.sqrt(252)
+# Crypto trades 24/7. Minutes in a year = 60 * 24 * 365.
+MINUTES_PER_YEAR = 60 * 24 * 365
 
 
 @dataclass
@@ -39,6 +41,48 @@ def calculate_sharpe(pnl_series: List[float]) -> float:
     if var <= 0.0:
         return 0.0
     return (mean / math.sqrt(var)) * ANNUALIZATION_FACTOR
+
+
+def calculate_sharpe_resampled(
+    pnl_with_ts: List[Tuple[int, float]],
+    bucket_seconds: int = 60,
+) -> float:
+    """Annualized Sharpe from a timestamped PnL stream.
+
+    Buckets the raw per-event samples into fixed-width time buckets
+    (default 1 minute), takes the last PnL in each bucket, computes
+    per-bucket returns, and annualizes with sqrt(buckets_per_year).
+    This avoids the silent bug of treating per-event samples as
+    daily returns.
+
+    pnl_with_ts: list of (timestamp_ms, pnl) ordered by timestamp.
+    Returns 0.0 for fewer than two buckets or zero variance.
+    """
+    if len(pnl_with_ts) < 2:
+        return 0.0
+    bucket_ms = bucket_seconds * 1000
+    bucketed: List[float] = []
+    cur_bucket = pnl_with_ts[0][0] // bucket_ms
+    last_pnl = pnl_with_ts[0][1]
+    for ts, pnl in pnl_with_ts[1:]:
+        b = ts // bucket_ms
+        if b != cur_bucket:
+            bucketed.append(last_pnl)
+            cur_bucket = b
+        last_pnl = pnl
+    bucketed.append(last_pnl)
+
+    if len(bucketed) < 2:
+        return 0.0
+    rets = [bucketed[i] - bucketed[i - 1] for i in range(1, len(bucketed))]
+    mean = sum(rets) / len(rets)
+    if len(rets) < 2:
+        return 0.0
+    var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+    if var <= 0.0:
+        return 0.0
+    buckets_per_year = MINUTES_PER_YEAR * 60 / bucket_seconds
+    return (mean / math.sqrt(var)) * math.sqrt(buckets_per_year)
 
 
 def calculate_hit_ratio(num_fills: int, num_quotes: int) -> float:

@@ -4,8 +4,9 @@ import time
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import pytest
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
 
 from src.models.fill_prob import (
     FEATURE_VECTOR_SIZE,
@@ -61,41 +62,32 @@ def test_extract_features_empty_book_raises() -> None:
         FillProbabilityModel.extract_features([], [(100.0, 1.0)], 99.0, 0.1, "buy")
 
 
-# ---------- training fixtures ----------
+# ---------- test fixture ----------
 
 
-def _synthetic_fills(n: int = 200) -> pd.DataFrame:
-    """Build a synthetic fills dataframe.
+def _fit_test_model() -> FillProbabilityModel:
+    """Fit a tiny logistic regression on a labeled feature array.
 
-    Each row is a real fill at a price near mid (positive label after
-    train() generates negatives at worse prices).
+    Not training data for production — just enough signal for the
+    predict/save/load tests to exercise a real fitted model. Labels
+    are constructed so price_distance (column 7) is the dominant
+    signal: closer to mid → higher fill probability.
     """
-    rng = np.random.default_rng(123)
-    rows = []
-    for _ in range(n):
-        mid = 100.0 + rng.normal(0.0, 0.1)
-        spread = 0.02 + rng.uniform(0.0, 0.02)
-        best_bid = mid - spread / 2
-        best_ask = mid + spread / 2
-        bids = [(best_bid - i * 0.01, 1.0 + rng.uniform(0, 1)) for i in range(5)]
-        asks = [(best_ask + i * 0.01, 1.0 + rng.uniform(0, 1)) for i in range(5)]
-        side = "buy" if rng.random() < 0.5 else "sell"
-        # Real fills happen near mid — within half the spread.
-        if side == "buy":
-            price = best_bid + rng.uniform(0.0, spread * 0.4)
-        else:
-            price = best_ask - rng.uniform(0.0, spread * 0.4)
-        rows.append({
-            "bids": bids,
-            "asks": asks,
-            "price": price,
-            "size": 0.01,
-            "side": side,
-        })
-    return pd.DataFrame(rows)
+    rng = np.random.default_rng(0)
+    n = 200
+    X = rng.normal(0.0, 1.0, size=(n, FEATURE_VECTOR_SIZE))
+    # Make column 7 (price_distance) monotonic with label inversion.
+    X[:, 7] = rng.uniform(0.0, 1.0, size=n)
+    y = (X[:, 7] < 0.5).astype(np.int64)
+
+    scaler = StandardScaler().fit(X)
+    model = LogisticRegression(max_iter=1000, random_state=42).fit(
+        scaler.transform(X), y,
+    )
+    return FillProbabilityModel(model=model, scaler=scaler, auc=None)
 
 
-# ---------- predict / train ----------
+# ---------- predict ----------
 
 
 def test_predict_before_train_raises() -> None:
@@ -106,16 +98,8 @@ def test_predict_before_train_raises() -> None:
         )
 
 
-def test_train_returns_auc_above_floor() -> None:
-    model = FillProbabilityModel()
-    auc = model.train(_synthetic_fills(300))
-    assert 0.0 <= auc <= 1.0
-    assert auc > 0.6
-
-
 def test_predict_returns_probability() -> None:
-    model = FillProbabilityModel()
-    model.train(_synthetic_fills(300))
+    model = _fit_test_model()
     p = model.predict(
         [(99.99, 1.0)], [(100.01, 1.0)], 99.99, 0.01, "buy",
     )
@@ -124,19 +108,16 @@ def test_predict_returns_probability() -> None:
 
 
 def test_closer_to_mid_higher_fill_prob() -> None:
-    model = FillProbabilityModel()
-    model.train(_synthetic_fills(400))
+    model = _fit_test_model()
     bids = [(99.99, 1.0), (99.98, 1.0)]
     asks = [(100.01, 1.0), (100.02, 1.0)]
-    # buy near mid vs buy far below mid
     p_close = model.predict(bids, asks, 99.99, 0.01, "buy")
     p_far = model.predict(bids, asks, 99.50, 0.01, "buy")
     assert p_close > p_far
 
 
 def test_save_load_roundtrip(tmp_path: Path) -> None:
-    model = FillProbabilityModel()
-    model.train(_synthetic_fills(300))
+    model = _fit_test_model()
     out = tmp_path / "model.joblib"
     model.save(out)
     assert out.exists()
@@ -155,11 +136,9 @@ def test_load_missing_file_raises(tmp_path: Path) -> None:
 
 
 def test_predict_under_one_millisecond() -> None:
-    model = FillProbabilityModel()
-    model.train(_synthetic_fills(300))
+    model = _fit_test_model()
     bids = [(99.99, 1.0)]
     asks = [(100.01, 1.0)]
-    # warm up
     for _ in range(10):
         model.predict(bids, asks, 99.99, 0.01, "buy")
     n = 200
@@ -168,17 +147,3 @@ def test_predict_under_one_millisecond() -> None:
         model.predict(bids, asks, 99.99, 0.01, "buy")
     avg_ms = (time.perf_counter() - t0) * 1000.0 / n
     assert avg_ms < 1.0, f"predict avg {avg_ms:.3f}ms exceeds 1ms"
-
-
-def test_train_rejects_missing_columns() -> None:
-    df = pd.DataFrame({"bids": [[(99.0, 1.0)]], "asks": [[(100.0, 1.0)]]})
-    model = FillProbabilityModel()
-    with pytest.raises(ValueError):
-        model.train(df)
-
-
-def test_train_rejects_empty_df() -> None:
-    df = pd.DataFrame(columns=["bids", "asks", "price", "size", "side"])
-    model = FillProbabilityModel()
-    with pytest.raises(ValueError):
-        model.train(df)

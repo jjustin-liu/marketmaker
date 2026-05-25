@@ -1,9 +1,11 @@
 """Fill probability model.
 
 Logistic regression over the 10-element feature vector defined in
-ARCHITECTURE.md. Trained on historical fills (positives) plus
-synthetic worse-priced negatives (5 per positive) to handle the
-class imbalance — most posted limit orders never fill.
+ARCHITECTURE.md. Training is done by scripts/train_model_lookahead.py,
+which builds labels by walking forward through recorded L2 diffs and
+checking whether each candidate quote was actually crossed within a
+fixed lookahead window. This class owns the inference path
+(extract_features / predict) and persistence (save / load).
 
 Input feature order (must match src/features/feature_generator.py):
   [bid_ask_spread, mid_price, bid_volume, ask_volume,
@@ -20,18 +22,12 @@ from typing import List, Optional, Tuple
 
 import joblib
 import numpy as np
-import pandas as pd
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
 from src.features.imbalance import calculate_imbalance
 
 FEATURE_VECTOR_SIZE = 10
-NEGATIVES_PER_POSITIVE = 5
-TRAIN_TEST_SPLIT = 0.2
-RANDOM_STATE = 42
 SIDE_BUY = 1.0
 SIDE_SELL = 0.0
 DEFAULT_MODEL_PATH = Path("data/models/fill_prob.joblib")
@@ -122,69 +118,6 @@ class FillProbabilityModel:
             size=size,
             side=side_val,
         )
-
-    def train(self, fills_df: pd.DataFrame) -> float:
-        """Train on a fills dataframe. Returns test-set ROC AUC.
-
-        Required columns: bids, asks, price, size, side.
-        bids/asks are lists of (price, qty) tuples.
-        side is 'buy' or 'sell'.
-        """
-        required = {"bids", "asks", "price", "size", "side"}
-        missing = required - set(fills_df.columns)
-        if missing:
-            raise ValueError(f"fills_df missing columns: {missing}")
-        if len(fills_df) == 0:
-            raise ValueError("fills_df is empty")
-
-        X_rows: List[np.ndarray] = []
-        y_rows: List[int] = []
-        rng = np.random.default_rng(RANDOM_STATE)
-
-        for _, row in fills_df.iterrows():
-            bids = [tuple(x) for x in row["bids"]]
-            asks = [tuple(x) for x in row["asks"]]
-            price = float(row["price"])
-            size = float(row["size"])
-            side = str(row["side"])
-
-            pos = self.extract_features(bids, asks, price, size, side)
-            X_rows.append(pos.to_array())
-            y_rows.append(1)
-
-            best_bid = bids[0][0]
-            best_ask = asks[0][0]
-            mid = (best_bid + best_ask) / 2.0
-            abs_spread = best_ask - best_bid
-
-            for _ in range(NEGATIVES_PER_POSITIVE):
-                offset = abs_spread * rng.uniform(0.5, 1.5)
-                if side == "buy":
-                    neg_price = mid - offset
-                else:
-                    neg_price = mid + offset
-                neg = self.extract_features(bids, asks, neg_price, size, side)
-                X_rows.append(neg.to_array())
-                y_rows.append(0)
-
-        X = np.vstack(X_rows)
-        y = np.array(y_rows, dtype=np.int64)
-
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=TRAIN_TEST_SPLIT, random_state=RANDOM_STATE,
-            stratify=y,
-        )
-
-        self.scaler = StandardScaler()
-        X_train_s = self.scaler.fit_transform(X_train)
-        X_test_s = self.scaler.transform(X_test)
-
-        self.model = LogisticRegression(max_iter=1000, random_state=RANDOM_STATE)
-        self.model.fit(X_train_s, y_train)
-
-        probs = self.model.predict_proba(X_test_s)[:, 1]
-        self.auc = float(roc_auc_score(y_test, probs))
-        return self.auc
 
     def predict(
         self,

@@ -26,13 +26,17 @@ def main() -> None:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--out", type=Path,
                         default=Path("data/backtest_results.csv"))
+    parser.add_argument("--fee-bps", type=float, default=0.0,
+                        help="signed maker fee in bps. Negative = rebate.")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     diffs = load_diffs_from_parquet(args.input)
     logger.info("loaded %d diffs", len(diffs))
 
-    naive_engine = BacktestEngine(strategy=NaiveMaker(), use_inventory=False)
+    naive_engine = BacktestEngine(
+        strategy=NaiveMaker(), use_inventory=False, fee_bps=args.fee_bps,
+    )
     naive = naive_engine.run(diffs)
 
     ev_engine = BacktestEngine(
@@ -41,6 +45,7 @@ def main() -> None:
             size_calculator=SizeCalculator(),
         ),
         use_inventory=True,
+        fee_bps=args.fee_bps,
     )
     ev = ev_engine.run(diffs)
 

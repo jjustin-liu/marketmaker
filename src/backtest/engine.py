@@ -9,9 +9,10 @@ when the opposite-side best price strictly crosses the resting quote
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, List, Optional, Protocol, Tuple
+from typing import Callable, Iterable, List, Optional, Protocol, Tuple
 
 import pandas as pd
 
@@ -20,10 +21,13 @@ from src.backtest.metrics import (
     calculate_adverse_selection,
     calculate_hit_ratio,
     calculate_max_drawdown,
-    calculate_sharpe,
+    calculate_sharpe_resampled,
 )
 from src.lob.order_book import OrderBook, Side
 from src.strategy.naive_maker import Quote
+
+BPS = 1e-4
+SIDES_PER_REFRESH = 2
 
 
 class QuoteStrategy(Protocol):
@@ -64,12 +68,17 @@ class BacktestEngine:
     refresh_every: int = 10
     markout_lookahead: int = 50  # diffs after fill for adverse selection
     use_inventory: bool = True   # pass inventory to strategy if it accepts
+    fee_bps: float = 0.0         # signed maker fee in bps. Negative = rebate.
+    sharpe_bucket_seconds: int = 60
+    on_tick: Optional[Callable[["BacktestEngine", bool], None]] = None
+    tick_sleep_seconds: float = 0.0
 
     book: OrderBook = field(default_factory=OrderBook)
     inventory: float = 0.0
     cash: float = 0.0
     fills: List[Fill] = field(default_factory=list)
     pnl_history: List[float] = field(default_factory=list)
+    pnl_with_ts: List[Tuple[int, float]] = field(default_factory=list)
     quote_count: int = 0
     open_bid: Optional[Quote] = None
     open_ask: Optional[Quote] = None
@@ -88,13 +97,22 @@ class BacktestEngine:
             mid = (best_bid + best_ask) / 2.0
             all_mids.append(mid)
 
+            fills_before = len(self.fills)
             self._maybe_fill(diff.timestamp, best_bid, best_ask, mid,
                              mids_at_fill_index, i)
+            new_fill = len(self.fills) > fills_before
 
             if i % self.refresh_every == 0:
                 self._refresh_quotes(mid, best_bid, best_ask)
 
-            self.pnl_history.append(self.cash + self.inventory * mid)
+            pnl_now = self.cash + self.inventory * mid
+            self.pnl_history.append(pnl_now)
+            self.pnl_with_ts.append((diff.timestamp, pnl_now))
+
+            if self.on_tick is not None:
+                self.on_tick(self, new_fill)
+            if self.tick_sleep_seconds > 0.0:
+                time.sleep(self.tick_sleep_seconds)
 
         mid_after = [
             all_mids[idx + self.markout_lookahead]
@@ -104,8 +122,12 @@ class BacktestEngine:
 
         return BacktestResult(
             pnl=self.pnl_history[-1] if self.pnl_history else 0.0,
-            sharpe=calculate_sharpe(self.pnl_history),
-            hit_ratio=calculate_hit_ratio(len(self.fills), self.quote_count),
+            sharpe=calculate_sharpe_resampled(
+                self.pnl_with_ts, self.sharpe_bucket_seconds,
+            ),
+            hit_ratio=calculate_hit_ratio(
+                len(self.fills), self.quote_count * SIDES_PER_REFRESH,
+            ),
             adverse_selection=calculate_adverse_selection(self.fills, mid_after),
             max_drawdown=calculate_max_drawdown(self.pnl_history),
             num_fills=len(self.fills),
@@ -123,22 +145,26 @@ class BacktestEngine:
     ) -> None:
         """Strict cross fill model — worst-case queue position."""
         if self.open_bid is not None and best_ask < self.open_bid.price:
+            notional = self.open_bid.price * self.open_bid.size
             f = Fill(timestamp=ts, side="buy",
                      price=self.open_bid.price, size=self.open_bid.size,
                      mid_at_fill=mid)
             self.fills.append(f)
             fill_indices.append(i)
             self.inventory += self.open_bid.size
-            self.cash -= self.open_bid.price * self.open_bid.size
+            self.cash -= notional
+            self.cash -= self.fee_bps * BPS * notional
             self.open_bid = None
         if self.open_ask is not None and best_bid > self.open_ask.price:
+            notional = self.open_ask.price * self.open_ask.size
             f = Fill(timestamp=ts, side="sell",
                      price=self.open_ask.price, size=self.open_ask.size,
                      mid_at_fill=mid)
             self.fills.append(f)
             fill_indices.append(i)
             self.inventory -= self.open_ask.size
-            self.cash += self.open_ask.price * self.open_ask.size
+            self.cash += notional
+            self.cash -= self.fee_bps * BPS * notional
             self.open_ask = None
 
     def _refresh_quotes(
@@ -169,29 +195,37 @@ class BacktestEngine:
         self.quote_count += 1
 
 
-def load_diffs_from_parquet(path: Path) -> List[Diff]:
+def load_diffs_from_parquet(path: Path, skip_rows: int = 0) -> List[Diff]:
     """Read a parquet file with columns: timestamp, side, price, qty.
 
     side column is either int (0/1) or str ('buy'/'sell'/'bid'/'ask').
+
+    skip_rows: drop the first N rows. Recorders that bootstrap the
+    book write a snapshot of ~2000 levels as the first 2000 rows of
+    each file; downstream replayers should skip those so they don't
+    appear in the metric series as a warm-up artifact.
     """
     df = pd.read_parquet(path)
+    if skip_rows > 0:
+        df = df.iloc[skip_rows:].reset_index(drop=True)
     required = {"timestamp", "side", "price", "qty"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"parquet missing columns: {missing}")
 
-    diffs: List[Diff] = []
-    for _, row in df.iterrows():
-        raw_side = row["side"]
-        if isinstance(raw_side, str):
-            s = raw_side.lower()
-            side = Side.BUY if s in ("buy", "bid", "b") else Side.SELL
-        else:
-            side = Side(int(raw_side))
-        diffs.append(Diff(
-            timestamp=int(row["timestamp"]),
-            side=side,
-            price=float(row["price"]),
-            qty=float(row["qty"]),
-        ))
-    return diffs
+    ts_arr = df["timestamp"].to_numpy(dtype="int64")
+    price_arr = df["price"].to_numpy(dtype="float64")
+    qty_arr = df["qty"].to_numpy(dtype="float64")
+    side_raw = df["side"].to_numpy()
+    if side_raw.dtype.kind in ("U", "O"):
+        side_arr = [
+            Side.BUY if str(s).lower() in ("buy", "bid", "b") else Side.SELL
+            for s in side_raw
+        ]
+    else:
+        side_arr = [Side(int(s)) for s in side_raw]
+    return [
+        Diff(timestamp=int(ts_arr[i]), side=side_arr[i],
+             price=float(price_arr[i]), qty=float(qty_arr[i]))
+        for i in range(len(df))
+    ]

@@ -118,6 +118,27 @@ def test_engine_ask_fills_when_bid_crosses() -> None:
     assert any(f.side == "sell" for f in eng.fills)
 
 
+def test_engine_on_tick_callback_fires_once_per_diff_and_flags_fills() -> None:
+    naive = NaiveMaker(NaiveMakerConfig(spread=0.04, size=0.1))
+    events: List[tuple] = []
+
+    def hook(engine, new_fill: bool) -> None:
+        events.append((engine.inventory, len(engine.fills), new_fill))
+
+    eng = BacktestEngine(strategy=naive, refresh_every=1,
+                         use_inventory=False, on_tick=hook)
+    diffs = _seed_book_diffs() + [
+        Diff(1, Side.SELL, 101.0, 0.0),
+        Diff(1, Side.SELL, 101.5, 0.0),
+        Diff(1, Side.SELL, 95.0, 1.0),
+    ]
+    eng.run(diffs)
+    # at least a few events fire (only diffs producing a valid mid count)
+    assert len(events) >= 3
+    # exactly one event flagged new_fill=True when the ask crashed
+    assert sum(1 for _, _, nf in events if nf) == 1
+
+
 def test_engine_no_fill_when_price_doesnt_reach() -> None:
     naive = NaiveMaker(NaiveMakerConfig(spread=0.001, size=0.1))
     eng = BacktestEngine(strategy=naive, refresh_every=1, use_inventory=False)
