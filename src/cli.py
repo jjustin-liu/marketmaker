@@ -6,6 +6,10 @@ Environment variables (live mode):
   MM_MAX_POSITION      default 0.01 (BTC)
   MM_MAX_DRAWDOWN      default 50   (USD)
   MM_POLL_SECONDS      default 0.1
+  MM_FEE_BPS           signed maker fee in bps for paper mode; default 0
+  MM_REQUOTE_THRESHOLD_BPS
+                       quote target move required before cancel/replace;
+                       default 0.5
   MM_FILL_MODEL_PATH   default data/models/fill_prob.joblib
   MM_SYMBOL            default 'BTCUSDT' (used for testnet orders)
   MM_METRICS_PORT      default 8000. Prometheus /metrics endpoint port
@@ -99,6 +103,10 @@ def _run_live(args: argparse.Namespace) -> int:
     max_position = float(os.environ.get("MM_MAX_POSITION", "0.01"))
     max_drawdown = float(os.environ.get("MM_MAX_DRAWDOWN", "50"))
     poll = float(os.environ.get("MM_POLL_SECONDS", "0.1"))
+    fee_bps = float(os.environ.get("MM_FEE_BPS", "0.0"))
+    requote_threshold_bps = float(os.environ.get(
+        "MM_REQUOTE_THRESHOLD_BPS", "0.5",
+    ))
     model_path = Path(os.environ.get(
         "MM_FILL_MODEL_PATH", "data/models/fill_prob.joblib",
     ))
@@ -125,12 +133,14 @@ def _run_live(args: argparse.Namespace) -> int:
     if api_key and api_secret:
         logger.info("BINANCE_API_KEY present -> testnet=%s engine", testnet)
         return _run_testnet(args, r, strategy, risk, symbol,
-                            api_key, api_secret, testnet)
+                            api_key, api_secret, testnet,
+                            requote_threshold_bps)
 
     logger.info("no Binance credentials -> paper simulator")
     manager = OrderManager(
         redis_client=r, strategy=strategy, risk_guard=risk,
-        poll_seconds=poll,
+        poll_seconds=poll, fee_bps=fee_bps,
+        requote_threshold_bps=requote_threshold_bps,
     )
     manager.run(max_seconds=args.duration)
     logger.info("manager exited. final inventory=%.6f pnl=%.4f fills=%d",
@@ -141,7 +151,8 @@ def _run_live(args: argparse.Namespace) -> int:
 
 def _run_testnet(args: argparse.Namespace, redis_client: Any,
                  strategy: Any, risk: Any, symbol: str,
-                 api_key: str, api_secret: str, testnet: bool) -> int:
+                 api_key: str, api_secret: str, testnet: bool,
+                 requote_threshold_bps: float) -> int:
     import asyncio
 
     from src.live.binance_gateway import BinanceGateway
@@ -153,6 +164,7 @@ def _run_testnet(args: argparse.Namespace, redis_client: Any,
             engine = TestnetEngine(
                 redis_client=redis_client, gateway=gateway,
                 strategy=strategy, risk_guard=risk, symbol=symbol,
+                requote_threshold_bps=requote_threshold_bps,
             )
             await engine.run(max_seconds=args.duration)
             logger.info("engine exited. final inventory=%.6f pnl=%.4f fills=%d",

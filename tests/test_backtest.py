@@ -167,6 +167,31 @@ def test_engine_runs_ev_maker_through() -> None:
     assert result.num_fills >= 0
 
 
+def test_engine_passes_depth_to_inventory_strategy() -> None:
+    class DepthSpyStrategy:
+        def __init__(self) -> None:
+            self.calls: List[dict] = []
+
+        def quote_prices(self, **kwargs):
+            self.calls.append(kwargs)
+            return (
+                NaiveMaker(NaiveMakerConfig(spread=0.001)).quote_prices(
+                    kwargs["mid_price"],
+                )
+            )
+
+    strategy = DepthSpyStrategy()
+    eng = BacktestEngine(strategy=strategy, refresh_every=1, use_inventory=True)
+    eng.run(_seed_book_diffs() * 2)
+
+    assert strategy.calls
+    call = strategy.calls[0]
+    assert "bid_probability" not in call
+    assert "ask_probability" not in call
+    assert call["bids"][0] == (99.0, 5.0)
+    assert call["asks"][0] == (101.0, 5.0)
+
+
 # ---------- parquet loader ----------
 
 
