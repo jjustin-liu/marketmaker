@@ -2,6 +2,10 @@
 
 Mirrors the C++ MatchEngine interface. Used in backtests and unit tests
 where readability matters more than throughput.
+
+Bids stored in a SortedDict keyed by negated price so index-0 = best bid.
+Asks stored in a SortedDict keyed by price (ascending) so index-0 = best ask.
+Both best_bid() and best_ask() are O(log n) instead of O(n).
 """
 
 from __future__ import annotations
@@ -9,6 +13,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Dict, List, Optional, Tuple
+
+from sortedcontainers import SortedDict
 
 
 class Side(IntEnum):
@@ -34,30 +40,48 @@ class Fill:
     timestamp: int
 
 
+def _neg(k: float) -> float:
+    return -k
+
+
 class OrderBook:
     """Limit order book with price-time priority matching."""
 
     def __init__(self) -> None:
-        # price -> FIFO list of resting orders at that price
-        self._bids: Dict[float, List[Order]] = {}
-        self._asks: Dict[float, List[Order]] = {}
-        # order_id -> (side, price) for O(log n) cancel
+        # Bids: SortedDict keyed on -price so peekitem(0) == best bid
+        self._bids: SortedDict = SortedDict(_neg)
+        # Asks: SortedDict keyed on +price so peekitem(0) == best ask
+        self._asks: SortedDict = SortedDict()
+        # order_id -> (side, price) for O(1) cancel lookup
         self._order_map: Dict[str, Tuple[Side, float]] = {}
 
     # ---- best price lookups ----
 
     def best_bid(self) -> Optional[float]:
-        return max(self._bids) if self._bids else None
+        if not self._bids:
+            return None
+        return self._bids.peekitem(0)[0]
 
     def best_ask(self) -> Optional[float]:
-        return min(self._asks) if self._asks else None
+        if not self._asks:
+            return None
+        return self._asks.peekitem(0)[0]
+
+    def qty_at(self, side: Side, price: float) -> float:
+        """Aggregate resting quantity at a price level (0 if absent)."""
+        book = self._bids if side == Side.BUY else self._asks
+        level = book.get(price)
+        if not level:
+            return 0.0
+        return sum(o.size for o in level)
 
     # ---- depth ----
 
     def depth(self, side: Side, levels: int) -> List[Tuple[float, float]]:
         """Return top `levels` price levels as [(price, total_qty), ...]."""
         book = self._bids if side == Side.BUY else self._asks
-        prices = sorted(book.keys(), reverse=(side == Side.BUY))[:levels]
+        # SortedDict keys are already in best-first order for each side
+        prices = list(book.keys())[:levels]
         return [(p, sum(o.size for o in book[p])) for p in prices]
 
     # ---- core operations ----
@@ -138,8 +162,8 @@ class OrderBook:
         remaining = size
 
         while remaining > 0 and opposite:
-            # best price on the opposite side
-            best_price = min(opposite) if side == Side.BUY else max(opposite)
+            # peekitem(0) is always the best price on the opposite side
+            best_price = opposite.peekitem(0)[0]
 
             # crossing check
             crosses = (
@@ -175,5 +199,7 @@ class OrderBook:
 
     def _rest(self, order: Order) -> None:
         book = self._bids if order.side == Side.BUY else self._asks
-        book.setdefault(order.price, []).append(order)
+        if order.price not in book:
+            book[order.price] = []
+        book[order.price].append(order)
         self._order_map[order.order_id] = (order.side, order.price)
