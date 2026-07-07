@@ -1,12 +1,18 @@
-"""Run the Binance feed for a fixed duration and dump Redis state.
+"""Run the Binance feed: WebSocket -> local book -> Redis.
 
-Smoke test for Phase 3. Requires a running local Redis on :6379.
+Two modes:
+  --duration N   run N seconds, then dump Redis state (smoke test)
+  --forever      run until Ctrl-C; feeds the live paper trader
+
+Requires a running local Redis on :6379.
 """
 
 import argparse
 import asyncio
 import json
 import logging
+import sys
+from typing import Optional
 
 import redis
 
@@ -19,7 +25,7 @@ logging.basicConfig(
 )
 
 
-async def main(symbol: str, duration: float, region: str) -> None:
+async def main(symbol: str, duration: Optional[float], region: str) -> None:
     r = redis.Redis(host="localhost", port=6379, decode_responses=True)
     feed = BinanceFeed(
         symbol=symbol,
@@ -29,8 +35,14 @@ async def main(symbol: str, duration: float, region: str) -> None:
         ask_side=CppSide.SELL,
         region=region,
     )
-    print(f"running feed for {duration}s on {symbol} via {region}...")
+    if duration is None:
+        print(f"running feed on {symbol} via {region} until Ctrl-C...")
+    else:
+        print(f"running feed for {duration}s on {symbol} via {region}...")
     await feed.run(stop_after_sec=duration)
+
+    if duration is None:
+        return
 
     print("\n--- redis state ---")
     for key in [
@@ -58,10 +70,16 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--symbol", default="btcusdt")
     p.add_argument("--duration", type=float, default=60.0)
+    p.add_argument("--forever", action="store_true",
+                   help="run until Ctrl-C (ignores --duration)")
     p.add_argument(
         "--region",
         default="VISION",
         choices=["GLOBAL", "VISION", "US", "TEST"],
     )
     args = p.parse_args()
-    asyncio.run(main(args.symbol, args.duration, args.region))
+    run_duration = None if args.forever else args.duration
+    try:
+        asyncio.run(main(args.symbol, run_duration, args.region))
+    except KeyboardInterrupt:
+        sys.exit(0)

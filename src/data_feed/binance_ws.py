@@ -53,6 +53,20 @@ DEFAULT_REGION = "VISION"
 logger = logging.getLogger(__name__)
 
 
+def stream_kind(stream: str) -> str | None:
+    """Classify a combined-stream name as 'depth', 'trade', or None.
+
+    Depth streams may carry an update-speed suffix ("btcusdt@depth" or
+    "btcusdt@depth@100ms"), so match on the "@depth" segment rather
+    than the string tail.
+    """
+    if "@depth" in stream:
+        return "depth"
+    if stream.endswith("@trade"):
+        return "trade"
+    return None
+
+
 def parse_depth_diff(payload: Dict[str, Any]) -> DepthDiff:
     """Parse a Binance depthUpdate event into a DepthDiff."""
     return DepthDiff(
@@ -163,7 +177,8 @@ class BinanceFeed:
                 stream = envelope.get("stream", "")
                 payload = envelope.get("data", {})
 
-                if stream.endswith("@depth"):
+                kind = stream_kind(stream)
+                if kind == "depth":
                     diff = parse_depth_diff(payload)
                     if not sync.synced:
                         sync.buffer(diff)
@@ -174,7 +189,7 @@ class BinanceFeed:
                     else:
                         sync.apply(diff)  # may raise GapDetected
                         self.writer.publish_book()
-                elif stream.endswith("@trade"):
+                elif kind == "trade":
                     price, qty, side, ts = parse_trade(payload)
                     self.writer.record_trade(price, qty, side, ts)
 

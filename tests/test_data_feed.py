@@ -236,3 +236,14 @@ def test_trade_ringbuffer_caps_at_100() -> None:
         writer.record_trade(100.0 + i, 1.0, "buy", i)
     assert len(writer.recent_trades) == 100
     assert writer.recent_trades[0]["timestamp"] == 50  # oldest 50 dropped
+
+
+def test_stream_kind_matches_depth_with_speed_suffix() -> None:
+    # Regression: the @depth@100ms subscription must still classify as
+    # depth — endswith("@depth") silently dropped every book update.
+    from src.data_feed.binance_ws import stream_kind
+    assert stream_kind("btcusdt@depth@100ms") == "depth"
+    assert stream_kind("btcusdt@depth") == "depth"
+    assert stream_kind("btcusdt@trade") == "trade"
+    assert stream_kind("btcusdt@aggTrade") is None
+    assert stream_kind("") is None
