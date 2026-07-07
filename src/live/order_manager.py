@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Optional, Protocol, Tuple
 
+from src.features.volatility import VolatilityCalculator
 from src.live.metrics import record_fill, record_quote_refresh, set_position
 from src.live.risk_guard import RiskGuard
 from src.strategy.naive_maker import Quote
@@ -118,6 +119,9 @@ class OrderManager:
             raise ValueError("requote_threshold_bps must be nonnegative")
         self._fee_bps = fee_bps
         self._requote_threshold_bps = requote_threshold_bps
+        # Rolling mid-price volatility feeds EVMaker's vol_risk_factor,
+        # mirroring the backtest engine. Never reset: live has no epochs.
+        self._vol_calc = VolatilityCalculator()
         self.state = ManagerState()
         # Watermark into the trades:stream Redis stream. Initialized to
         # "$" the first time we read so we only see trades posted after
@@ -134,6 +138,7 @@ class OrderManager:
             return True  # feed not ready yet, keep waiting
         best_bid, best_ask, bids, asks = book
         mid = (best_bid + best_ask) / 2.0
+        volatility = self._vol_calc.update(mid)
 
         self._simulate_fills_queue_aware(mid)
         self._mark_to_market(mid)
@@ -151,6 +156,7 @@ class OrderManager:
                 inventory=self.state.inventory,
                 bids=bids,
                 asks=asks,
+                volatility=volatility,
             )
         except Exception as exc:  # strategy bug shouldn't kill the loop silently
             logger.exception("strategy raised; halting: %s", exc)

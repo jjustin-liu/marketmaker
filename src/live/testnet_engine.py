@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
+from src.features.volatility import VolatilityCalculator
 from src.live.binance_gateway import BinanceGateway, BinanceGatewayError
 from src.live.metrics import record_fill, record_quote_refresh, set_position
 from src.live.order_manager import StrategyProtocol
@@ -74,6 +75,9 @@ class TestnetEngine:
         if requote_threshold_bps < 0:
             raise ValueError("requote_threshold_bps must be nonnegative")
         self._requote_threshold_bps = requote_threshold_bps
+        # Rolling mid-price volatility feeds EVMaker's vol_risk_factor,
+        # mirroring the backtest engine. Never reset: live has no epochs.
+        self._vol_calc = VolatilityCalculator()
         self.state = EngineState()
         self._fills_log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -86,6 +90,7 @@ class TestnetEngine:
             return True
         best_bid, best_ask, bids, asks = book
         mid = (best_bid + best_ask) / 2.0
+        volatility = self._vol_calc.update(mid)
 
         await self._poll_fills(mid)
         self._mark_to_market(mid)
@@ -103,6 +108,7 @@ class TestnetEngine:
                 inventory=self.state.inventory,
                 bids=bids,
                 asks=asks,
+                volatility=volatility,
             )
         except Exception as exc:
             logger.exception("strategy raised; halting")

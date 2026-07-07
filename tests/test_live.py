@@ -402,3 +402,43 @@ def test_target_quotes_published_to_redis(tmp_path: Path) -> None:
     assert "strategy:target_bid" in r.store
     bid_obj = json.loads(r.store["strategy:target_bid"])
     assert bid_obj["price"] == pytest.approx(100.5)
+
+
+# ---------- volatility threading ----------
+
+
+class RecordingStrategy:
+    """Captures quote_prices kwargs; returns fixed passive quotes."""
+
+    def __init__(self) -> None:
+        self.calls: List[dict] = []
+
+    def quote_prices(self, **kwargs: Any) -> Tuple[Quote, Quote]:
+        self.calls.append(kwargs)
+        return Quote(price=99.0, size=0.001), Quote(price=102.0, size=0.001)
+
+
+def test_volatility_threaded_to_strategy(tmp_path: Path) -> None:
+    from src.features.volatility import VolatilityCalculator
+
+    r = FakeRedis()
+    strat = RecordingStrategy()
+    mgr = OrderManager(
+        redis_client=r,
+        strategy=strat,
+        risk_guard=RiskGuard(RiskConfig(max_position=1.0, max_drawdown=1e9)),
+        fills_log_path=tmp_path / "fills.log",
+    )
+    mids = []
+    for bid, ask in [(100.0, 101.0), (110.0, 111.0), (90.0, 91.0)]:
+        _seed_book(r, best_bid=bid, best_ask=ask)
+        mgr.step()
+        mids.append((bid + ask) / 2.0)
+
+    oracle = VolatilityCalculator()
+    expected = [oracle.update(m) for m in mids]
+    got = [c["volatility"] for c in strat.calls]
+    assert got == pytest.approx(expected)
+    # one observation -> zero vol; three moving mids -> positive vol
+    assert got[0] == 0.0
+    assert got[2] > 0.0

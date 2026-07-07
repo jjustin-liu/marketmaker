@@ -10,7 +10,9 @@ Environment variables (live mode):
   MM_REQUOTE_THRESHOLD_BPS
                        quote target move required before cancel/replace;
                        default 0.5
-  MM_FILL_MODEL_PATH   default data/models/fill_prob.joblib
+  MM_FILL_MODEL_PATH   default data/models/fill_prob.joblib. If the
+                       file is missing or unreadable, live mode warns
+                       and runs EVMaker at uniform P(fill)=0.5
   MM_SYMBOL            default 'BTCUSDT' (used for testnet orders)
   MM_METRICS_PORT      default 8000. Prometheus /metrics endpoint port
   BINANCE_API_KEY      optional; if set with BINANCE_API_SECRET,
@@ -44,6 +46,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     bt.add_argument("--out", type=Path,
                     default=Path("data/backtest_results.csv"))
     bt.add_argument("--fee-bps", type=float, default=0.0)
+    bt.add_argument("--fill-mode", default=None,
+                    choices=("queue", "trades", "strict_cross"))
 
     live = sub.add_parser("live",
                           help="run paper-mode order manager against Redis")
@@ -60,6 +64,8 @@ def _run_backtest(args: argparse.Namespace) -> int:
         "--out", str(args.out),
         "--fee-bps", str(args.fee_bps),
     ]
+    if args.fill_mode is not None:
+        sys.argv += ["--fill-mode", args.fill_mode]
     backtest_main()
     return 0
 
@@ -70,8 +76,17 @@ def _build_strategy(model_path: Path) -> Any:
     from src.strategy.inventory_skew import InventorySkew
     from src.strategy.size_calculator import SizeCalculator
 
-    fill_model = FillProbabilityModel.load(model_path)
-    logger.info("loaded fill model from %s", model_path)
+    # Missing/corrupt model degrades to uniform P(fill)=0.5, same as
+    # the backtest runner. Live must not crash on a model file issue.
+    fill_model: Optional[FillProbabilityModel] = None
+    try:
+        fill_model = FillProbabilityModel.load(model_path)
+        logger.info("loaded fill model from %s", model_path)
+    except Exception as exc:
+        logger.warning(
+            "fill model unavailable at %s (%s) — EVMaker falling back "
+            "to uniform P(fill)=0.5", model_path, exc,
+        )
     return EVMaker(
         inventory_skew=InventorySkew(),
         size_calculator=SizeCalculator(),
