@@ -149,7 +149,7 @@ class BinanceFeed:
 
         stream_url = (
             f"{self._ws_base}?streams="
-            f"{self._symbol}@depth/{self._symbol}@trade"
+            f"{self._symbol}@depth@100ms/{self._symbol}@trade"
         )
         snapshot_fetch: asyncio.Task[Snapshot] | None = None
 
