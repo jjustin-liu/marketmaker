@@ -1,7 +1,5 @@
 """Tests for the strategy layer."""
 
-from typing import List, Tuple
-
 import pytest
 
 from src.strategy.ev_maker import EVConfig, EVMaker
@@ -37,6 +35,33 @@ def test_naive_rejects_bad_mid() -> None:
     m = NaiveMaker()
     with pytest.raises(ValueError):
         m.quote_prices(0.0)
+
+
+def test_naive_never_crosses_on_tight_book() -> None:
+    # Regression: a 1-cent-wide book must not produce an inverted,
+    # self-filling quote. The market-anchored spread keeps it inside.
+    m = NaiveMaker(NaiveMakerConfig(spread=0.001))
+    bid, ask = m.quote_prices(76832.505, best_bid=76832.50, best_ask=76832.51)
+    assert bid.price < ask.price
+    # quote rests strictly inside the touch — never marketable
+    assert 76832.50 < bid.price < ask.price < 76832.51
+
+
+def test_naive_quotes_symmetric_inside_market() -> None:
+    # market_spread=2, capped at 1.0, aggressiveness 0.2 → half=0.4
+    m = NaiveMaker(NaiveMakerConfig(spread=0.05, aggressiveness=0.2))
+    bid, ask = m.quote_prices(100.0, best_bid=99.0, best_ask=101.0)
+    assert bid.price == pytest.approx(99.6)
+    assert ask.price == pytest.approx(100.4)
+
+
+def test_naive_aggressiveness_pulls_toward_mid() -> None:
+    cfg_tight = NaiveMakerConfig(spread=0.05, aggressiveness=0.8)
+    cfg_wide = NaiveMakerConfig(spread=0.05, aggressiveness=0.2)
+    bid_t, _ = NaiveMaker(cfg_tight).quote_prices(100.0, 99.0, 101.0)
+    bid_w, _ = NaiveMaker(cfg_wide).quote_prices(100.0, 99.0, 101.0)
+    # higher aggressiveness → bid closer to mid (higher)
+    assert bid_t.price > bid_w.price
 
 
 # ---------- InventorySkew ----------
@@ -155,7 +180,9 @@ def _make_ev_maker(fill_model=None) -> EVMaker:
         inventory_skew=InventorySkew(),
         size_calculator=SizeCalculator(),
         fill_model=fill_model,
-        config=EVConfig(min_spread=0.0005, max_spread=0.005, num_points=10),
+        config=EVConfig(
+            min_half_spread_mult=0.25, max_half_spread_mult=3.0, num_points=10,
+        ),
     )
 
 
@@ -170,63 +197,123 @@ def test_ev_ask_above_bid() -> None:
     assert ask.price > bid.price
 
 
-def test_ev_min_spread_enforced() -> None:
+def test_ev_min_spread_floor_enforced() -> None:
+    # Even a degenerate near-zero market spread can't collapse the pair.
     ev = _make_ev_maker()
     bid, ask = ev.quote_prices(
         mid_price=100.0,
         inventory=0.0,
+        bids=[(100.0, 1.0)],
+        asks=[(100.0, 1.0)],  # zero market spread → fallback + floor
         bid_probability=1.0,
         ask_probability=1.0,
     )
-    # With p=1.0 everywhere, EV is maximized at the widest offset, but min
-    # spread must still hold.
-    assert (ask.price - bid.price) >= 0.0005 * 100.0 - 1e-9
+    floor = EVConfig().min_spread_bps * 100.0 / 10_000.0
+    assert (ask.price - bid.price) >= floor - 1e-12
 
 
-def test_ev_picks_highest_ev_offset() -> None:
-    class _Model:
+def test_ev_anchors_to_market_spread() -> None:
+    # A wider live book → proportionally wider EV quotes (scale-aware).
+    class _Flat:
         def predict(self, bids, asks, price, size, side):
-            # Prefer wide offsets — fill_prob constant at 1.0
             return 1.0
 
-    fake_bids: List[Tuple[float, float]] = [(99.95, 1.0)]
-    fake_asks: List[Tuple[float, float]] = [(100.05, 1.0)]
-    ev = _make_ev_maker(fill_model=_Model())
+    ev = _make_ev_maker(fill_model=_Flat())
+    b_tight, a_tight = ev.quote_prices(
+        mid_price=100.0, inventory=0.0,
+        bids=[(99.95, 1.0)], asks=[(100.05, 1.0)],   # 0.10 spread
+    )
+    ev2 = _make_ev_maker(fill_model=_Flat())
+    b_wide, a_wide = ev2.quote_prices(
+        mid_price=100.0, inventory=0.0,
+        bids=[(99.5, 1.0)], asks=[(100.5, 1.0)],     # 1.0 spread
+    )
+    assert (a_wide.price - b_wide.price) > (a_tight.price - b_tight.price)
+
+
+def test_ev_constant_prob_picks_widest() -> None:
+    # Flat fill prob → EV = P*h monotonic in h → argmax at the widest.
+    class _Flat:
+        def predict(self, bids, asks, price, size, side):
+            return 1.0
+
+    ev = _make_ev_maker(fill_model=_Flat())
     bid, ask = ev.quote_prices(
-        mid_price=100.0,
-        inventory=0.0,
-        bids=fake_bids,
-        asks=fake_asks,
+        mid_price=100.0, inventory=0.0,
+        bids=[(99.95, 1.0)], asks=[(100.05, 1.0)],
     )
-    # With constant P=1, EV = offset * 1 is maximized at max offset.
-    # So quotes should sit near the widest point of the search range.
-    max_off = 0.005 * 100.0
-    assert (100.0 - bid.price) > max_off * 0.5
-    assert (ask.price - 100.0) > max_off * 0.5
+    market_spread = 0.10
+    # widest half-spread = max_half_spread_mult (3.0) * market_spread
+    assert (100.0 - bid.price) == pytest.approx(3.0 * market_spread)
+    assert (ask.price - 100.0) == pytest.approx(3.0 * market_spread)
 
 
-def test_ev_uses_fallback_probabilities() -> None:
-    ev = _make_ev_maker()
-    bid_high, ask_high = ev.quote_prices(
+def test_ev_decaying_prob_quotes_tight() -> None:
+    # Fill prob that decays fast with distance from mid → EV argmax at a
+    # tight half-spread, not the widest. This is the corrected tradeoff.
+    class _Decay:
+        def predict(self, bids, asks, price, size, side):
+            mid = (bids[0][0] + asks[0][0]) / 2.0
+            dist = abs(price - mid)
+            return max(0.0, 1.0 - 50.0 * dist)  # sharp decay
+
+    ev = _make_ev_maker(fill_model=_Decay())
+    bid, ask = ev.quote_prices(
         mid_price=100.0, inventory=0.0,
-        bid_probability=1.0, ask_probability=1.0,
+        bids=[(99.95, 1.0)], asks=[(100.05, 1.0)],
     )
-    ev2 = _make_ev_maker()
-    bid_low, ask_low = ev2.quote_prices(
-        mid_price=100.0, inventory=0.0,
-        bid_probability=0.001, ask_probability=0.001,
-    )
-    # High-prob → wider quotes (EV grows with offset). Low-prob → tighter.
-    assert (ask_high.price - bid_high.price) >= (ask_low.price - bid_low.price)
+    market_spread = 0.10
+    # chosen half-spread well below the widest (3 * market_spread)
+    assert (100.0 - bid.price) < 3.0 * market_spread
+    assert (ask.price - bid.price) > 0.0
+
+
+def test_ev_high_inventory_widens_quotes() -> None:
+    # Risk term: heavier inventory → wider band → wider final spread.
+    class _Flat:
+        def predict(self, bids, asks, price, size, side):
+            return 1.0
+
+    book_bids = [(99.95, 1.0)]
+    book_asks = [(100.05, 1.0)]
+    ev = _make_ev_maker(fill_model=_Flat())
+    b0, a0 = ev.quote_prices(100.0, inventory=0.0,
+                             bids=book_bids, asks=book_asks)
+    ev2 = _make_ev_maker(fill_model=_Flat())
+    b1, a1 = ev2.quote_prices(100.0, inventory=0.5,
+                              bids=book_bids, asks=book_asks)
+    assert (a1.price - b1.price) > (a0.price - b0.price)
+
+
+def test_ev_high_volatility_widens_quotes() -> None:
+    class _Flat:
+        def predict(self, bids, asks, price, size, side):
+            return 1.0
+
+    book_bids = [(99.95, 1.0)]
+    book_asks = [(100.05, 1.0)]
+    ev = _make_ev_maker(fill_model=_Flat())
+    b0, a0 = ev.quote_prices(100.0, inventory=0.0,
+                             bids=book_bids, asks=book_asks, volatility=0.0)
+    ev2 = _make_ev_maker(fill_model=_Flat())
+    b1, a1 = ev2.quote_prices(100.0, inventory=0.0,
+                              bids=book_bids, asks=book_asks, volatility=0.5)
+    assert (a1.price - b1.price) > (a0.price - b0.price)
 
 
 def test_ev_invalid_config() -> None:
     with pytest.raises(ValueError):
-        EVConfig(min_spread=0.0)
+        EVConfig(min_half_spread_mult=0.0)
     with pytest.raises(ValueError):
-        EVConfig(min_spread=0.01, max_spread=0.005)
+        EVConfig(inv_risk_factor=-1.0)
+    with pytest.raises(ValueError):
+        EVConfig(vol_risk_factor=-1.0)
+    with pytest.raises(ValueError):
+        EVConfig(min_half_spread_mult=3.0, max_half_spread_mult=1.0)
     with pytest.raises(ValueError):
         EVConfig(num_points=1)
+    with pytest.raises(ValueError):
+        EVConfig(min_spread_bps=0.0)
 
 
 def test_ev_inventory_skew_affects_quotes() -> None:
