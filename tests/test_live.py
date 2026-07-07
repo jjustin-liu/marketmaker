@@ -38,6 +38,9 @@ class FakeRedis:
 
     def __init__(self) -> None:
         self.store: Dict[str, str] = {}
+        # Stream: stream_key -> list of (id, fields_dict)
+        self.streams: Dict[str, List[Tuple[str, Dict[str, str]]]] = {}
+        self._seq = 0
 
     def get(self, key: str) -> Optional[str]:
         return self.store.get(key)
@@ -55,6 +58,45 @@ class FakeRedis:
 
     def pipeline(self) -> FakeRedisPipeline:
         return FakeRedisPipeline(self.store)
+
+    def xadd(self, stream: str, fields: Dict[str, str],
+             maxlen: Optional[int] = None,
+             approximate: bool = False) -> str:
+        self._seq += 1
+        entry_id = f"{self._seq}-0"
+        s = self.streams.setdefault(stream, [])
+        s.append((entry_id, {k: str(v) for k, v in fields.items()}))
+        if maxlen is not None and len(s) > maxlen:
+            del s[: len(s) - maxlen]
+        return entry_id
+
+    def xread(self, streams: Dict[str, str],
+              block: Optional[int] = None,
+              count: int = 100) -> List[Tuple[str, List[Tuple[str, Dict[str, str]]]]]:
+        def _seq(entry_id: str) -> int:
+            try:
+                return int(entry_id.split("-", 1)[0])
+            except (ValueError, AttributeError):
+                return 0
+
+        results: List[Tuple[str, List[Tuple[str, Dict[str, str]]]]] = []
+        for stream, after_id in streams.items():
+            entries = self.streams.get(stream, [])
+            if after_id == "$":
+                continue
+            after_seq = _seq(after_id)
+            new = [(eid, f) for eid, f in entries if _seq(eid) > after_seq]
+            if new:
+                results.append((stream, new[:count]))
+        return results
+
+
+def _push_trade(redis: FakeRedis, price: float, qty: float, side: str) -> None:
+    redis.xadd(
+        "trades:stream",
+        {"price": str(price), "qty": str(qty),
+         "side": side, "timestamp": "0"},
+    )
 
 
 class StubStrategy:
@@ -142,7 +184,8 @@ def test_risk_guard_trip_forces_halt() -> None:
 # ---------- paper fills ----------
 
 
-def test_paper_bid_fills_when_best_ask_crosses(tmp_path: Path) -> None:
+def test_paper_bid_fills_when_taker_sells_consume_queue(tmp_path: Path) -> None:
+    """Bid at empty level (queue=0) → any sell trade at our price fills us."""
     r = FakeRedis()
     _seed_book(r, best_bid=100.0, best_ask=101.0)
     mgr = OrderManager(
@@ -151,44 +194,60 @@ def test_paper_bid_fills_when_best_ask_crosses(tmp_path: Path) -> None:
         risk_guard=RiskGuard(RiskConfig(max_position=1.0, max_drawdown=1e9)),
         fills_log_path=tmp_path / "fills.log",
     )
-    mgr.step()                                       # post quotes
-    _seed_book(r, best_bid=99.0, best_ask=100.4)     # ask < our bid 100.5
+    mgr.step()  # post quotes
+    # Our bid is at 100.5 — empty level → queue_ahead_bid = 0.
+    # Any taker sell at >= 100.5 should fill us immediately.
+    _push_trade(r, price=100.5, qty=0.01, side="sell")
     mgr.step()
     assert any(f["side"] == "buy" for f in mgr.state.fills)
     assert mgr.state.inventory == pytest.approx(0.001)
 
 
-def test_paper_ask_fills_when_best_bid_crosses(tmp_path: Path) -> None:
+def test_paper_ask_fills_when_taker_buys_consume_queue(tmp_path: Path) -> None:
     r = FakeRedis()
     _seed_book(r, best_bid=100.0, best_ask=101.0)
     mgr = OrderManager(
         redis_client=r,
-        strategy=StubStrategy(bid_price=100.5, ask_price=101.5),
+        # Quote inside the spread on both sides — empty levels, queue=0.
+        strategy=StubStrategy(bid_price=100.5, ask_price=100.7),
         risk_guard=RiskGuard(RiskConfig(max_position=1.0, max_drawdown=1e9)),
         fills_log_path=tmp_path / "fills.log",
     )
     mgr.step()
-    _seed_book(r, best_bid=102.0, best_ask=103.0)    # bid > our ask 101.5
+    _push_trade(r, price=100.7, qty=0.01, side="buy")
     mgr.step()
     assert any(f["side"] == "sell" for f in mgr.state.fills)
     assert mgr.state.inventory == pytest.approx(-0.001)
 
 
-def test_paper_inventory_updates_after_fill(tmp_path: Path) -> None:
+def test_queue_ahead_blocks_fill_until_consumed(tmp_path: Path) -> None:
+    """Bid at a level with 1.0 of existing volume → queue_ahead=1.0.
+    Small taker trades shouldn't fill us until they cumulatively eat the queue.
+    """
     r = FakeRedis()
-    _seed_book(r, best_bid=100.0, best_ask=101.0)
+    # Bid at 100.0 has 1.0 size sitting in front of us when we join it.
+    r.set("lob:best_bid", 100.0)
+    r.set("lob:best_ask", 101.0)
+    r.set("lob:levels:bids", json.dumps([[100.0, 1.0]]))
+    r.set("lob:levels:asks", json.dumps([[101.0, 1.0]]))
     mgr = OrderManager(
         redis_client=r,
-        strategy=StubStrategy(bid_price=100.5, ask_price=101.5, size=0.01),
+        strategy=StubStrategy(bid_price=100.0, ask_price=101.0),
         risk_guard=RiskGuard(RiskConfig(max_position=1.0, max_drawdown=1e9)),
         fills_log_path=tmp_path / "fills.log",
     )
     mgr.step()
-    _seed_book(r, best_bid=99.0, best_ask=100.4)
+    assert mgr.state.queue_ahead_bid == pytest.approx(1.0)
+
+    _push_trade(r, price=100.0, qty=0.4, side="sell")
+    _push_trade(r, price=100.0, qty=0.4, side="sell")
     mgr.step()
-    assert mgr.state.inventory == pytest.approx(0.01)
-    assert mgr.state.cash == pytest.approx(-100.5 * 0.01)
-    assert r.store["position:inventory"] == str(0.01)
+    assert mgr.state.fills == []
+    assert mgr.state.queue_ahead_bid == pytest.approx(0.2)
+
+    _push_trade(r, price=100.0, qty=0.5, side="sell")
+    mgr.step()
+    assert any(f["side"] == "buy" for f in mgr.state.fills)
 
 
 def test_paper_fill_applies_signed_fee_bps(tmp_path: Path) -> None:
@@ -202,7 +261,7 @@ def test_paper_fill_applies_signed_fee_bps(tmp_path: Path) -> None:
         fee_bps=1.0,
     )
     mgr.step()
-    _seed_book(r, best_bid=99.0, best_ask=100.4)
+    _push_trade(r, price=100.5, qty=0.05, side="sell")
     mgr.step()
 
     notional = 100.5 * 0.01
@@ -258,12 +317,13 @@ def test_risk_halt_stops_loop(tmp_path: Path) -> None:
         fills_log_path=tmp_path / "fills.log",
     )
     assert mgr.step() is True                        # post quotes, no fills
-    _seed_book(r, best_bid=99.0, best_ask=100.4)     # forces a buy fill
+    _push_trade(r, price=100.5, qty=0.1, side="sell")  # buy fill triggered
     assert mgr.step() is False                       # 0.05 > 0.01 cap, halt
     assert mgr._risk.halted
 
 
-def test_no_fill_when_quote_not_crossed(tmp_path: Path) -> None:
+def test_no_fill_when_no_taker_trades(tmp_path: Path) -> None:
+    """With no trades in the stream, no fills regardless of book moves."""
     r = FakeRedis()
     _seed_book(r, best_bid=100.0, best_ask=101.0)
     mgr = OrderManager(
@@ -273,7 +333,7 @@ def test_no_fill_when_quote_not_crossed(tmp_path: Path) -> None:
         fills_log_path=tmp_path / "fills.log",
     )
     mgr.step()
-    _seed_book(r, best_bid=100.1, best_ask=100.9)    # tightens but no cross
+    _seed_book(r, best_bid=100.1, best_ask=100.9)    # book tightens, but no trades
     mgr.step()
     assert mgr.state.fills == []
 
@@ -320,7 +380,7 @@ def test_fill_is_written_to_log(tmp_path: Path) -> None:
         fills_log_path=log,
     )
     mgr.step()
-    _seed_book(r, best_bid=99.0, best_ask=100.4)
+    _push_trade(r, price=100.5, qty=0.01, side="sell")
     mgr.step()
     contents = log.read_text().strip().splitlines()
     assert len(contents) == 1

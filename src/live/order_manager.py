@@ -29,6 +29,7 @@ DEFAULT_POLL_SECONDS = 0.1
 DEFAULT_FILLS_LOG = Path("data/fills.log")
 BPS = 1e-4
 DEFAULT_REQUOTE_THRESHOLD_BPS = 0.5
+TRADE_STREAM_KEY = "trades:stream"
 
 
 class StrategyProtocol(Protocol):
@@ -36,6 +37,44 @@ class StrategyProtocol(Protocol):
 
     def quote_prices(self, *args: Any, **kwargs: Any) -> Tuple[Quote, Quote]:
         ...
+
+
+def _decode(value: Any) -> str:
+    """Redis returns bytes by default; decode_responses=True returns str."""
+    if isinstance(value, bytes):
+        return value.decode()
+    return str(value) if value is not None else ""
+
+
+def _queue_ahead_for_bid(
+    our_price: float, bids: List[Tuple[float, float]],
+) -> float:
+    """Volume that must trade before our resting bid gets hit.
+
+    Includes (a) all visible qty at bid prices strictly higher than
+    ours (those have price priority and fill first) and (b) the qty
+    already at our exact price level (we joined the back of the queue).
+    """
+    total = 0.0
+    for price, qty in bids:
+        if price > our_price:
+            total += qty
+        elif price == our_price:
+            total += qty
+    return total
+
+
+def _queue_ahead_for_ask(
+    our_price: float, asks: List[Tuple[float, float]],
+) -> float:
+    """Volume that must trade before our resting ask gets hit."""
+    total = 0.0
+    for price, qty in asks:
+        if price < our_price:
+            total += qty
+        elif price == our_price:
+            total += qty
+    return total
 
 
 @dataclass
@@ -47,6 +86,12 @@ class ManagerState:
     pnl: float = 0.0
     open_bid: Optional[Quote] = None
     open_ask: Optional[Quote] = None
+    # Queue-ahead size: total volume that must trade through our level
+    # before we get filled. Snapshotted at post time as the visible
+    # bid/ask qty at our price (plus higher-priority levels). Decremented
+    # by each observed taker trade at or through our price.
+    queue_ahead_bid: float = 0.0
+    queue_ahead_ask: float = 0.0
     fills: List[dict] = field(default_factory=list)
 
 
@@ -74,6 +119,10 @@ class OrderManager:
         self._fee_bps = fee_bps
         self._requote_threshold_bps = requote_threshold_bps
         self.state = ManagerState()
+        # Watermark into the trades:stream Redis stream. Initialized to
+        # "$" the first time we read so we only see trades posted after
+        # we start; otherwise we'd replay history on startup.
+        self._last_trade_id: Optional[str] = None
         self._fills_log_path.parent.mkdir(parents=True, exist_ok=True)
 
     # ---- public loop control ----
@@ -86,7 +135,7 @@ class OrderManager:
         best_bid, best_ask, bids, asks = book
         mid = (best_bid + best_ask) / 2.0
 
-        self._simulate_fills(best_bid, best_ask, mid)
+        self._simulate_fills_queue_aware(mid)
         self._mark_to_market(mid)
 
         halt = self._risk.check(self.state.inventory, self.state.pnl)
@@ -109,7 +158,7 @@ class OrderManager:
             self._cancel_all()
             return False
 
-        self._refresh_quotes_if_needed(bid_q, ask_q, mid)
+        self._refresh_quotes_if_needed(bid_q, ask_q, mid, bids, asks)
         self._publish_open_quotes()
         self._publish_position()
         record_quote_refresh()
@@ -152,16 +201,82 @@ class OrderManager:
         asks = [(float(p), float(q)) for p, q in json.loads(asks_raw)]
         return best_bid, best_ask, bids, asks
 
-    def _simulate_fills(self, best_bid: float, best_ask: float,
-                        mid: float) -> None:
-        """Strict-cross fill rule, same model as the backtest."""
+    def _simulate_fills_queue_aware(self, mid: float) -> None:
+        """Queue-aware fill rule.
+
+        Reads taker trades from the trades:stream Redis stream since the
+        last seen ID. For each trade whose price reaches our resting
+        quote, decrements queue_ahead. When queue_ahead <= 0, books a
+        fill at our quote price.
+
+        A market sell (aggressor='sell') trade reports the bid price
+        it executed against. If that price is >= our_bid_price, the
+        trade consumed bids at our level or higher-priority levels,
+        which sit ahead of us in priority — so we decrement queue_ahead.
+        Symmetric for asks: market-buy trades at price <= our_ask_price
+        consume our queue-ahead.
+        """
         s = self.state
-        if s.open_bid is not None and best_ask < s.open_bid.price:
-            self._book_fill("buy", s.open_bid.price, s.open_bid.size, mid)
-            s.open_bid = None
-        if s.open_ask is not None and best_bid > s.open_ask.price:
-            self._book_fill("sell", s.open_ask.price, s.open_ask.size, mid)
-            s.open_ask = None
+        events = self._read_new_trades()
+        for ev in events:
+            price = float(ev["price"])
+            qty = float(ev["qty"])
+            side = ev["side"]
+            if (side == "sell" and s.open_bid is not None
+                    and price >= s.open_bid.price):
+                s.queue_ahead_bid -= qty
+                if s.queue_ahead_bid <= 0:
+                    self._book_fill("buy", s.open_bid.price,
+                                    s.open_bid.size, mid)
+                    s.open_bid = None
+                    s.queue_ahead_bid = 0.0
+            elif (side == "buy" and s.open_ask is not None
+                    and price <= s.open_ask.price):
+                s.queue_ahead_ask -= qty
+                if s.queue_ahead_ask <= 0:
+                    self._book_fill("sell", s.open_ask.price,
+                                    s.open_ask.size, mid)
+                    s.open_ask = None
+                    s.queue_ahead_ask = 0.0
+
+    def _read_new_trades(self) -> List[dict]:
+        """Return list of trade events posted since our last watermark.
+
+        On the first call, advances the watermark past every entry
+        currently in the stream and returns empty — we only care about
+        trades that occur after the manager starts running.
+        """
+        try:
+            if self._last_trade_id is None:
+                self._last_trade_id = "0-0"
+                resp = self._redis.xread(
+                    {TRADE_STREAM_KEY: "0-0"}, block=None, count=10000,
+                )
+                if resp:
+                    for _stream, entries in resp:
+                        for entry_id, _fields in entries:
+                            self._last_trade_id = _decode(entry_id)
+                return []
+            resp = self._redis.xread(
+                {TRADE_STREAM_KEY: self._last_trade_id}, block=None,
+                count=500,
+            )
+        except Exception as exc:  # redis hiccup must not kill the loop
+            logger.warning("xread failed: %s", exc)
+            return []
+        if not resp:
+            return []
+        events: List[dict] = []
+        for _stream, entries in resp:
+            for entry_id, fields in entries:
+                events.append({
+                    "id": _decode(entry_id),
+                    "price": _decode(fields.get(b"price") or fields.get("price")),
+                    "qty": _decode(fields.get(b"qty") or fields.get("qty")),
+                    "side": _decode(fields.get(b"side") or fields.get("side")),
+                })
+                self._last_trade_id = _decode(entry_id)
+        return events
 
     def _book_fill(self, side: str, price: float, size: float,
                    mid_at_fill: float) -> None:
@@ -196,12 +311,20 @@ class OrderManager:
 
     def _refresh_quotes_if_needed(
         self, target_bid: Quote, target_ask: Quote, mid: float,
+        bids: List[Tuple[float, float]],
+        asks: List[Tuple[float, float]],
     ) -> None:
         threshold = self._requote_threshold_bps * BPS * mid
         if self._should_replace(self.state.open_bid, target_bid, threshold):
             self.state.open_bid = target_bid
+            self.state.queue_ahead_bid = _queue_ahead_for_bid(
+                target_bid.price, bids,
+            )
         if self._should_replace(self.state.open_ask, target_ask, threshold):
             self.state.open_ask = target_ask
+            self.state.queue_ahead_ask = _queue_ahead_for_ask(
+                target_ask.price, asks,
+            )
 
     @staticmethod
     def _should_replace(
