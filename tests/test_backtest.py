@@ -396,3 +396,67 @@ def test_load_diffs_back_compat_without_is_snapshot(tmp_path: Path) -> None:
     df.to_parquet(p)
     diffs = load_diffs_from_parquet(p)
     assert [d.timestamp for d in diffs] == [1, 2, 3]
+
+
+# ---------- fill-mode resolution (scripts/run_backtest.py) ----------
+
+
+def test_resolve_fill_mode_auto_picks_trades_when_sibling_exists(
+    tmp_path,
+) -> None:
+    from scripts.run_backtest import resolve_fill_mode
+    depth = tmp_path / "btcusdt_depth_2026-07-01.parquet"
+    sibling = tmp_path / "btcusdt_trades_2026-07-01.parquet"
+    depth.touch()
+    sibling.touch()
+    mode, trades_path = resolve_fill_mode(None, depth, None)
+    assert mode == "trades"
+    assert trades_path == sibling
+
+
+def test_resolve_fill_mode_auto_falls_back_to_queue(tmp_path) -> None:
+    from scripts.run_backtest import resolve_fill_mode
+    depth = tmp_path / "btcusdt_depth_2026-07-01.parquet"
+    depth.touch()
+    mode, trades_path = resolve_fill_mode(None, depth, None)
+    assert mode == "queue"
+    assert trades_path is None
+
+
+def test_resolve_fill_mode_explicit_queue_ignores_sibling(tmp_path) -> None:
+    from scripts.run_backtest import resolve_fill_mode
+    depth = tmp_path / "btcusdt_depth_2026-07-01.parquet"
+    (tmp_path / "btcusdt_trades_2026-07-01.parquet").touch()
+    depth.touch()
+    mode, trades_path = resolve_fill_mode("queue", depth, None)
+    assert mode == "queue"
+    assert trades_path is None
+
+
+def test_resolve_fill_mode_explicit_strict_cross(tmp_path) -> None:
+    from scripts.run_backtest import resolve_fill_mode
+    depth = tmp_path / "btcusdt_depth_2026-07-01.parquet"
+    depth.touch()
+    mode, trades_path = resolve_fill_mode("strict_cross", depth, None)
+    assert mode == "strict_cross"
+    assert trades_path is None
+
+
+def test_resolve_fill_mode_explicit_trades_requires_file(tmp_path) -> None:
+    from scripts.run_backtest import resolve_fill_mode
+    depth = tmp_path / "btcusdt_depth_2026-07-01.parquet"
+    depth.touch()
+    with pytest.raises(SystemExit):
+        resolve_fill_mode("trades", depth, None)
+
+
+def test_resolve_fill_mode_trades_arg_beats_sibling(tmp_path) -> None:
+    from scripts.run_backtest import resolve_fill_mode
+    depth = tmp_path / "btcusdt_depth_2026-07-01.parquet"
+    explicit = tmp_path / "other_trades.parquet"
+    (tmp_path / "btcusdt_trades_2026-07-01.parquet").touch()
+    depth.touch()
+    explicit.touch()
+    mode, trades_path = resolve_fill_mode(None, depth, explicit)
+    assert mode == "trades"
+    assert trades_path == explicit

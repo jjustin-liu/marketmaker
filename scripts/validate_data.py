@@ -3,7 +3,10 @@
 Replays each parquet through a Python OrderBook and reports:
   - schema completeness
   - snapshot seed presence
-  - crossed-book ticks (post-warmup)
+  - crossed-book state at event boundaries (rows sharing a timestamp
+    form one exchange event; the book is only well-defined once the
+    whole event has applied — intra-event states routinely "cross"
+    while one side's rows land before the other's)
   - timestamp monotonicity gaps
   - duplicate rows
 
@@ -72,13 +75,31 @@ def validate_file(path: Path, clean: bool = False) -> bool:
     ts_arr = diff_df["timestamp"].to_numpy()
     backwards_gaps = int((ts_arr[1:] < ts_arr[:-1]).sum()) if len(ts_arr) > 1 else 0
 
-    # 5. Replay to detect crossed-book ticks (epoch-aware)
-    # Each is_snapshot=True block after live diffs marks a reconnect — reset book.
+    # 5. Replay to detect crossed books at event boundaries (epoch-aware)
+    # Each is_snapshot=True block after live diffs marks a reconnect — reset
+    # book. Crossing is only meaningful once a full timestamp group (one
+    # exchange event) has applied; intra-event states are transient.
     book = OrderBook()
     crossed = 0
+    events_checked = 0
+    row_crossed = 0
     total_live_ticks = 0
     warmup_end: Optional[int] = None
     _in_snapshot = False
+    prev_ts: Optional[int] = None
+
+    def _book_crossed() -> bool:
+        bb = book.best_bid()
+        ba = book.best_ask()
+        return bb is not None and ba is not None and bb >= ba
+
+    def _check_boundary() -> None:
+        nonlocal events_checked, crossed
+        if not snap_ok and total_live_ticks <= WARMUP_TICKS:
+            return  # legacy unseeded file still warming up
+        events_checked += 1
+        if _book_crossed():
+            crossed += 1
 
     for row in df.itertuples(index=False):
         is_snap = (
@@ -87,11 +108,17 @@ def validate_file(path: Path, clean: bool = False) -> bool:
         )
 
         if is_snap and not _in_snapshot:
-            # Epoch boundary: wipe old book state
+            # Epoch boundary: close out the last event, wipe old book state
+            if prev_ts is not None:
+                _check_boundary()
+                prev_ts = None
             book = OrderBook()
             _in_snapshot = True
         elif not is_snap:
             _in_snapshot = False
+
+        if not is_snap and prev_ts is not None and row.timestamp != prev_ts:
+            _check_boundary()
 
         side = _parse_side(row.side)
         book.apply_diff(side, float(row.price), float(row.qty))
@@ -99,23 +126,22 @@ def validate_file(path: Path, clean: bool = False) -> bool:
         if is_snap:
             continue
 
-        bb = book.best_bid()
-        ba = book.best_ask()
-        if bb is None or ba is None:
-            continue
-
         total_live_ticks += 1
+        prev_ts = int(row.timestamp)
 
-        if total_live_ticks <= WARMUP_TICKS:
-            if warmup_end is None and bb < ba:
-                warmup_end = total_live_ticks
-            continue
+        if warmup_end is None and not _book_crossed():
+            warmup_end = total_live_ticks
+        if total_live_ticks > WARMUP_TICKS and _book_crossed():
+            row_crossed += 1
 
-        if bb >= ba:
-            crossed += 1
+    if prev_ts is not None:
+        _check_boundary()
 
-    post_warmup_ticks = max(0, total_live_ticks - WARMUP_TICKS)
-    crossed_pct = (crossed / post_warmup_ticks * 100) if post_warmup_ticks > 0 else 0.0
+    crossed_pct = (crossed / events_checked * 100) if events_checked > 0 else 0.0
+    post_warmup_rows = max(0, total_live_ticks - WARMUP_TICKS)
+    row_crossed_pct = (
+        row_crossed / post_warmup_rows * 100 if post_warmup_rows > 0 else 0.0
+    )
 
     # Determine overall status
     issues: List[str] = []
@@ -126,7 +152,7 @@ def validate_file(path: Path, clean: bool = False) -> bool:
     if backwards_gaps > 0:
         issues.append(f"{backwards_gaps} time gaps")
     if crossed_pct > 1.0:
-        issues.append(f"{crossed_pct:.1f}% crossed ticks")
+        issues.append(f"{crossed_pct:.1f}% crossed events")
 
     status = "CLEAN" if not issues else "WARN: " + ", ".join(issues)
     status_sym = "✓" if not issues else "✗"
@@ -134,7 +160,9 @@ def validate_file(path: Path, clean: bool = False) -> bool:
     print(f"  Rows:            {total_rows:,}")
     print(f"  Snapshot rows:   {snap_str}")
     print(f"  Live ticks:      {total_live_ticks:,}")
-    print(f"  Crossed ticks:   {crossed_pct:.2f}% (post-warmup {WARMUP_TICKS})")
+    print(f"  Events:          {events_checked:,}")
+    print(f"  Crossed events:  {crossed_pct:.2f}% "
+          f"(intra-event transients: {row_crossed_pct:.1f}% of rows)")
     print(f"  Time gaps:       {backwards_gaps}")
     print(f"  Duplicates:      {dup_count}")
     print(f"  Status:          {status_sym} {status}")

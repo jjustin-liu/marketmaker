@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
+from typing import Optional, Tuple
 
 from src.backtest.engine import (
     BacktestEngine,
@@ -93,6 +94,41 @@ def print_table(
     print()
 
 
+def resolve_fill_mode(
+    explicit: Optional[str],
+    input_path: Path,
+    trades_arg: Optional[Path],
+) -> Tuple[str, Optional[Path]]:
+    """Pick the fill mode and the trades file to load (None = don't).
+
+    explicit=None auto-detects: trades mode if a trades file is given or
+    a sibling _trades_ file sits beside the input, else queue mode.
+    Explicit "trades" requires a trades file and exits with an error if
+    none exists. Explicit "queue"/"strict_cross" skip trades entirely.
+    """
+    sibling: Optional[Path] = None
+    if trades_arg is not None and trades_arg.exists():
+        sibling = trades_arg
+    elif "_depth_" in input_path.name:
+        candidate = input_path.with_name(
+            input_path.name.replace("_depth_", "_trades_"))
+        if candidate.exists():
+            sibling = candidate
+
+    if explicit is None:
+        if sibling is not None:
+            return "trades", sibling
+        return "queue", None
+    if explicit == "trades":
+        if sibling is None:
+            logger.error(
+                "--fill-mode trades but no trades parquet found "
+                "(pass --trades PATH or record one alongside the depth file)")
+            raise SystemExit(1)
+        return "trades", sibling
+    return explicit, None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run NaiveMaker vs EVMaker backtest.")
     parser.add_argument("--input", type=Path, required=True,
@@ -109,6 +145,10 @@ def main() -> None:
     parser.add_argument("--trades", type=Path, default=None,
                         help="Trades parquet. Default: sibling _trades_ file "
                              "if present. Enables trade-driven fills.")
+    parser.add_argument("--fill-mode", default=None,
+                        choices=("queue", "trades", "strict_cross"),
+                        help="Override fill simulation. Default: trades if a "
+                             "trades parquet is found, else queue.")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -124,22 +164,16 @@ def main() -> None:
     else:
         logger.info("  %d diffs loaded", len(diffs))
 
-    # Trade-driven fills if a trades file is given or sits beside the input.
-    trades_path = args.trades
-    if trades_path is None:
-        sibling = args.input.with_name(
-            args.input.name.replace("_depth_", "_trades_"))
-        if "_depth_" in args.input.name and sibling.exists():
-            trades_path = sibling
+    fill_mode, trades_path = resolve_fill_mode(
+        args.fill_mode, args.input, args.trades,
+    )
     trades = None
-    fill_mode = "queue"
-    if trades_path is not None and trades_path.exists():
+    if trades_path is not None:
         trades = load_trades_from_parquet(trades_path)
-        fill_mode = "trades"
         logger.info("  %d trades loaded from %s → trade-driven fills",
                     len(trades), trades_path.name)
     else:
-        logger.info("  no trades file → queue-mode (depth-only) fills")
+        logger.info("  no trades → %s (depth-only) fills", fill_mode)
 
     # NaiveMaker
     logger.info("Running NaiveMaker ...")

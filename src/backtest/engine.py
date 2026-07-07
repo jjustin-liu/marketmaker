@@ -92,6 +92,8 @@ class BacktestEngine:
     # "strict_cross": fill only when the market sweeps through our price
     # (worst-case queue). "queue": fill as the depth ahead of us at our
     # price is consumed (depth-only proxy for trade flow) or on a touch.
+    # "trades": fill resting quotes from executed trade prints passed via
+    # run(trades=...), merged by timestamp — most realistic.
     fill_mode: str = "strict_cross"
     on_tick: Optional[Callable[["BacktestEngine", bool], None]] = None
     tick_sleep_seconds: float = 0.0
@@ -364,11 +366,12 @@ def load_diffs_from_parquet(path: Path, skip_rows: int = 0) -> List[Diff]:
 
     side column is either int (0/1) or str ('buy'/'sell'/'bid'/'ask').
 
-    If an is_snapshot column is present, rows are reordered so all
-    snapshot rows come first (in stable file order, so bid/ask blocks
-    stay coherent), followed by diff rows in stable file order. This
-    lets the replay book seed itself completely before any diff fires
-    and eliminates the warmup-region cross artifact.
+    If an is_snapshot column is present, file order is preserved. Real
+    daily files hold many snapshot blocks (one per reconnect or
+    scheduled re-snapshot) interleaved with diffs; the engine treats
+    each False→True is_snapshot transition as an epoch boundary that
+    resets the book. Sorting snapshot rows to the front would merge
+    different point-in-time books and cross the replay.
 
     skip_rows: legacy workaround for pre-is_snapshot parquets. Ignored
     when is_snapshot is present.
