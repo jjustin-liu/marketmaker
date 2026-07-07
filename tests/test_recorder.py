@@ -5,12 +5,15 @@ from __future__ import annotations
 import pytest
 
 from scripts.run_recorder import (
+    SNAPSHOT_LIMIT,
     GapDetected,
     ParquetRotator,
+    apply_rows_to_book,
     book_to_snapshot_rows,
     filter_buffered_diffs,
     parse_depth_message,
     parse_trade_message,
+    resnapshot_due,
     snapshot_to_rows,
 )
 
@@ -117,3 +120,40 @@ def test_book_to_snapshot_rows_drops_zero_qty_levels() -> None:
     assert all(r["qty"] > 0 for r in rows)
     sides = {r["side"] for r in rows}
     assert sides == {"buy", "sell"}
+
+
+def test_snapshot_limit_is_5000() -> None:
+    # REST /api/v3/depth max. A shallower snapshot leaves stale deep
+    # levels in replay that never receive a qty=0 delete.
+    assert SNAPSHOT_LIMIT == 5000
+
+
+def test_resnapshot_due_threshold() -> None:
+    assert resnapshot_due(now=6 * 3600.0, last_bootstrap=0.0,
+                          resnapshot_hours=6.0) is True
+    assert resnapshot_due(now=6 * 3600.0 - 1, last_bootstrap=0.0,
+                          resnapshot_hours=6.0) is False
+
+
+def test_resnapshot_due_disabled_when_zero() -> None:
+    assert resnapshot_due(now=1e12, last_bootstrap=0.0,
+                          resnapshot_hours=0.0) is False
+
+
+def test_apply_rows_to_book_applies_snapshot_rows_and_deletes() -> None:
+    book: dict = {"buy": {}, "sell": {}}
+    rows = [
+        {"timestamp": 1, "side": "buy", "price": 100.0, "qty": 2.0,
+         "is_snapshot": True},
+        {"timestamp": 1, "side": "sell", "price": 101.0, "qty": 1.0,
+         "is_snapshot": True},
+        {"timestamp": 2, "side": "buy", "price": 100.0, "qty": 0.0,
+         "is_snapshot": False},
+        {"timestamp": 2, "side": "buy", "price": 99.0, "qty": 3.0,
+         "is_snapshot": False},
+    ]
+    n_diffs = apply_rows_to_book(book, rows)
+    # snapshot rows seed the book, diff qty=0 deletes the seeded level
+    assert book == {"buy": {99.0: 3.0}, "sell": {101.0: 1.0}}
+    # only the two diff rows count toward tick statistics
+    assert n_diffs == 2

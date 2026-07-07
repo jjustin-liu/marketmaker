@@ -20,8 +20,9 @@ cannot affect live trading.
 Usage:
   python -m scripts.run_recorder [--hours 24] [--symbol btcusdt]
                                  [--out data/raw] [--flush-rows 10000]
-                                 [--no-bootstrap]   # legacy mode
-                                 [--no-trades]      # depth only
+                                 [--no-bootstrap]        # legacy mode
+                                 [--no-trades]           # depth only
+                                 [--resnapshot-hours 6]  # 0 disables
 """
 
 from __future__ import annotations
@@ -56,13 +57,33 @@ REST_BASES = {
     "TEST": "https://testnet.binance.vision",
 }
 DEFAULT_REGION = "VISION"
-SNAPSHOT_LIMIT = 1000
+SNAPSHOT_LIMIT = 5000  # REST /api/v3/depth max; shrinks stale-deep-level window
+DEFAULT_RESNAPSHOT_HOURS = 6.0
 
 logger = logging.getLogger("recorder")
 
 
 class GapDetected(Exception):
     """Sequence gap. Caller must drop state and restart."""
+
+
+class ResnapshotDue(Exception):
+    """Scheduled re-snapshot. Caller flushes and re-bootstraps."""
+
+
+def resnapshot_due(
+    now: float, last_bootstrap: float, resnapshot_hours: float,
+) -> bool:
+    """True when a scheduled re-snapshot should trigger.
+
+    Re-bootstrapping every few hours writes a fresh is_snapshot block
+    mid-file, which replay treats as an epoch boundary — pruning stale
+    levels that sit below the snapshot depth and never receive a qty=0
+    delete. Disabled when resnapshot_hours <= 0.
+    """
+    if resnapshot_hours <= 0:
+        return False
+    return now - last_bootstrap >= resnapshot_hours * 3600.0
 
 
 class ParquetRotator:
@@ -189,6 +210,26 @@ def book_to_snapshot_rows(
     return rows
 
 
+def apply_rows_to_book(book: dict, rows: List[dict]) -> int:
+    """Apply parquet rows to a {side: {price: qty}} book in order.
+
+    Snapshot rows seed levels exactly like diffs set them; qty=0
+    deletes the level. Returns the number of diff (non-snapshot) rows
+    applied so callers can keep tick statistics diff-based.
+    """
+    n_diffs = 0
+    for r in rows:
+        side = r["side"]
+        qty = r["qty"]
+        if qty == 0:
+            book[side].pop(r["price"], None)
+        else:
+            book[side][r["price"]] = qty
+        if not r.get("is_snapshot"):
+            n_diffs += 1
+    return n_diffs
+
+
 async def fetch_snapshot(
     session: aiohttp.ClientSession,
     symbol: str,
@@ -296,6 +337,7 @@ async def record(
     region: str,
     use_bootstrap: bool = True,
     use_trades: bool = True,
+    resnapshot_hours: float = DEFAULT_RESNAPSHOT_HOURS,
 ) -> None:
     if region not in WS_BASES:
         raise ValueError(f"unknown region {region!r}; pick from {list(WS_BASES)}")
@@ -329,17 +371,7 @@ async def record(
 
     def _apply_to_live_book(rows_to_apply: List[dict]) -> None:
         nonlocal tick_count, crossed_count
-        for r in rows_to_apply:
-            if r.get("is_snapshot"):
-                continue
-            side = r["side"]
-            price = r["price"]
-            qty = r["qty"]
-            if qty == 0:
-                live_book[side].pop(price, None)
-            else:
-                live_book[side][price] = qty
-            tick_count += 1
+        tick_count += apply_rows_to_book(live_book, rows_to_apply)
 
         # Crossed-book check after batch
         bids = live_book["buy"]
@@ -354,16 +386,28 @@ async def record(
                     best_bid, best_ask,
                 )
 
+    last_bootstrap = loop.time()
+
     async with aiohttp.ClientSession() as http:
         while not stop.is_set():
             try:
                 async with websockets.connect(stream_url) as ws:
                     logger.info("connected to %s", stream_url)
                     if use_bootstrap:
+                        pre_bootstrap_rows = len(rotator.buffer)
                         last_u = await _bootstrap_session(
                             ws, http, symbol, rest_base, rotator,
                         )
-                        _apply_to_live_book(rotator.buffer)
+                        # Fresh snapshot supersedes everything held so
+                        # far: reset the book, then apply only the rows
+                        # this bootstrap appended (older unflushed rows
+                        # would re-add stale levels).
+                        live_book["buy"].clear()
+                        live_book["sell"].clear()
+                        _apply_to_live_book(
+                            rotator.buffer[pre_bootstrap_rows:]
+                        )
+                        last_bootstrap = loop.time()
                     else:
                         last_u = -1
 
@@ -394,6 +438,13 @@ async def record(
                             last_u = u
 
                         now_loop = loop.time()
+                        if use_bootstrap and resnapshot_due(
+                            now_loop, last_bootstrap, resnapshot_hours,
+                        ):
+                            raise ResnapshotDue(
+                                f"last bootstrap "
+                                f"{(now_loop - last_bootstrap) / 3600:.1f}h ago"
+                            )
                         if now_loop - last_status_time >= STATUS_INTERVAL_SEC:
                             bids = live_book["buy"]
                             asks = live_book["sell"]
@@ -438,6 +489,10 @@ async def record(
                             logger.info(
                                 "flushed %d rows (total %d)", n, total_rows,
                             )
+            except ResnapshotDue as e:
+                logger.info("scheduled re-snapshot (%s); re-bootstrapping", e)
+                rotator.flush()
+                trade_rotator.flush()
             except GapDetected as e:
                 logger.warning("sequence gap — %s; flushing and re-bootstrapping in 2s", e)
                 rotator.flush()
@@ -469,6 +524,10 @@ def main() -> None:
                         help="skip the REST snapshot bootstrap (legacy mode)")
     parser.add_argument("--no-trades", action="store_true",
                         help="record depth only; skip the @trade stream")
+    parser.add_argument("--resnapshot-hours", type=float,
+                        default=DEFAULT_RESNAPSHOT_HOURS,
+                        help="re-bootstrap from a fresh REST snapshot every "
+                             "N hours to prune stale deep levels; 0 disables")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -479,6 +538,7 @@ def main() -> None:
             args.symbol, args.out, duration, args.flush_rows, args.region,
             use_bootstrap=not args.no_bootstrap,
             use_trades=not args.no_trades,
+            resnapshot_hours=args.resnapshot_hours,
         ))
     except KeyboardInterrupt:
         sys.exit(0)
