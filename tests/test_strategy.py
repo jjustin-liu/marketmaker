@@ -98,13 +98,26 @@ def test_skew_spread_widens_with_inventory() -> None:
 
 
 def test_skew_continuity_clip_limits_movement() -> None:
-    cfg = InventorySkewConfig(continuity_clip=0.01)
+    cfg = InventorySkewConfig(continuity_clip_bps=1.0)
     s = InventorySkew(cfg)
     b0, a0 = s.apply_skew(100.0, 0.0)
-    # Big mid jump
+    # Big mid jump; per-refresh movement capped at 1 bps of mid
     b1, a1 = s.apply_skew(110.0, 0.0)
-    assert abs(b1 - b0) <= cfg.continuity_clip + 1e-9
-    assert abs(a1 - a0) <= cfg.continuity_clip + 1e-9
+    limit = 110.0 * cfg.continuity_clip_bps / 10_000.0
+    assert abs(b1 - b0) <= limit + 1e-9
+    assert abs(a1 - a0) <= limit + 1e-9
+
+
+def test_skew_clip_is_relative_tracks_price_scale() -> None:
+    # Regression: an absolute $0.10 clip made quotes lag mid by dollars
+    # on BTC-scale prices. At 5 bps of a 63k mid, one refresh may move
+    # ~$31 — a $10 repricing must complete in a single refresh.
+    cfg = InventorySkewConfig(continuity_clip_bps=5.0)
+    s = InventorySkew(cfg)
+    b0, _ = s.apply_skew(63_400.0, 0.0)
+    b1, a1 = s.apply_skew(63_410.0, 0.0)
+    mid_spread = a1 - b1
+    assert b1 == pytest.approx(63_410.0 - mid_spread / 2.0, abs=1e-6)
 
 
 def test_skew_clips_extreme_inventory() -> None:
@@ -120,7 +133,7 @@ def test_skew_invalid_config_raises() -> None:
     with pytest.raises(ValueError):
         InventorySkewConfig(max_position=-1.0)
     with pytest.raises(ValueError):
-        InventorySkewConfig(continuity_clip=0.0)
+        InventorySkewConfig(continuity_clip_bps=0.0)
 
 
 # ---------- SizeCalculator ----------
@@ -214,19 +227,22 @@ def test_ev_min_spread_floor_enforced() -> None:
 
 def test_ev_anchors_to_market_spread() -> None:
     # A wider live book → proportionally wider EV quotes (scale-aware).
+    # Spreads sit under the anchor cap (0.05 bps of mid = 0.50 here)
+    # so the anchor tracks the live book, not the ceiling.
     class _Flat:
         def predict(self, bids, asks, price, size, side):
             return 1.0
 
+    mid = 100_000.0
     ev = _make_ev_maker(fill_model=_Flat())
     b_tight, a_tight = ev.quote_prices(
-        mid_price=100.0, inventory=0.0,
-        bids=[(99.95, 1.0)], asks=[(100.05, 1.0)],   # 0.10 spread
+        mid_price=mid, inventory=0.0,
+        bids=[(mid - 0.05, 1.0)], asks=[(mid + 0.05, 1.0)],  # 0.10 spread
     )
     ev2 = _make_ev_maker(fill_model=_Flat())
     b_wide, a_wide = ev2.quote_prices(
-        mid_price=100.0, inventory=0.0,
-        bids=[(99.5, 1.0)], asks=[(100.5, 1.0)],     # 1.0 spread
+        mid_price=mid, inventory=0.0,
+        bids=[(mid - 0.20, 1.0)], asks=[(mid + 0.20, 1.0)],  # 0.40 spread
     )
     assert (a_wide.price - b_wide.price) > (a_tight.price - b_tight.price)
 
@@ -237,15 +253,16 @@ def test_ev_constant_prob_picks_widest() -> None:
         def predict(self, bids, asks, price, size, side):
             return 1.0
 
+    mid = 100_000.0
     ev = _make_ev_maker(fill_model=_Flat())
     bid, ask = ev.quote_prices(
-        mid_price=100.0, inventory=0.0,
-        bids=[(99.95, 1.0)], asks=[(100.05, 1.0)],
+        mid_price=mid, inventory=0.0,
+        bids=[(mid - 0.05, 1.0)], asks=[(mid + 0.05, 1.0)],
     )
     market_spread = 0.10
     # widest half-spread = max_half_spread_mult (3.0) * market_spread
-    assert (100.0 - bid.price) == pytest.approx(3.0 * market_spread)
-    assert (ask.price - 100.0) == pytest.approx(3.0 * market_spread)
+    assert (mid - bid.price) == pytest.approx(3.0 * market_spread)
+    assert (ask.price - mid) == pytest.approx(3.0 * market_spread)
 
 
 def test_ev_decaying_prob_quotes_tight() -> None:
@@ -329,3 +346,46 @@ def test_ev_inventory_skew_affects_quotes() -> None:
     )
     # Long → quote centre below mid → midpoint of (b1, a1) < midpoint of (b0, a0)
     assert (b1.price + a1.price) / 2 < (b0.price + a0.price) / 2
+
+
+def test_ev_never_quotes_through_the_touch() -> None:
+    # A hard inventory skew pushes the centre above the best ask; the
+    # final bid must still rest below it (a bid at/above the ask would
+    # be a marketable order, not a quote).
+    ev = EVMaker(
+        inventory_skew=InventorySkew(InventorySkewConfig(
+            max_position=0.01, skew_factor=100.0,
+        )),
+        size_calculator=SizeCalculator(),
+        fill_model=None,
+        config=EVConfig(inv_risk_factor=0.0, vol_risk_factor=0.0),
+    )
+    best_bid, best_ask = 100.00, 100.05
+    bid, ask = ev.quote_prices(
+        mid_price=(best_bid + best_ask) / 2.0,
+        inventory=-0.01,  # pinned short → centre shifted far up
+        bids=[(best_bid, 1.0)],
+        asks=[(best_ask, 1.0)],
+    )
+    assert bid.price < best_ask
+    assert ask.price > best_bid
+    assert ask.price > bid.price
+
+
+def test_ev_anchor_capped_on_transient_wide_spread() -> None:
+    # A mid-event book with its touch consumed can show a $7+ "spread".
+    # The candidate band must anchor to the capped value, not the spike,
+    # or quotes park dollars away where only toxic sweeps fill them.
+    ev = _make_ev_maker()
+    mid = 63_400.0
+    cap = mid * EVConfig().max_anchor_spread_bps / 10_000.0
+    bid, ask = ev.quote_prices(
+        mid_price=mid,
+        inventory=0.0,
+        bids=[(mid - 25.0, 1.0)],
+        asks=[(mid + 25.0, 1.0)],  # transient $50 spread
+        bid_probability=1.0,
+        ask_probability=1.0,
+    )
+    max_half = 3.0 * cap  # band top at max_half_spread_mult x capped anchor
+    assert (ask.price - bid.price) / 2.0 <= max_half + 1e-9

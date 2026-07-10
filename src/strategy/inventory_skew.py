@@ -22,7 +22,11 @@ class InventorySkewConfig:
     skew_factor: float = 0.5
     min_spread_bps: float = 1.0
     spread_factor: float = 1.0
-    continuity_clip: float = 0.1
+    # Per-refresh quote movement cap, in bps of mid. Denominated
+    # relative so it damps flapping on noise but never makes quotes
+    # lag a real repricing by dollars (an absolute cap did exactly
+    # that on BTC: $0.10/refresh vs $10 mid moves).
+    continuity_clip_bps: float = 5.0
     float_tolerance: float = 1e-10
 
     def __post_init__(self) -> None:
@@ -34,8 +38,8 @@ class InventorySkewConfig:
             raise ValueError("min_spread_bps must be positive")
         if self.spread_factor < 0:
             raise ValueError("spread_factor must be non-negative")
-        if self.continuity_clip <= 0:
-            raise ValueError("continuity_clip must be positive")
+        if self.continuity_clip_bps <= 0:
+            raise ValueError("continuity_clip_bps must be positive")
 
 
 def _clip(x: float, lo: float, hi: float) -> float:
@@ -72,7 +76,7 @@ class InventorySkew:
         ask_price = mid_price + centre_shift + half_spread
 
         if self._prev_bid is not None and self._prev_ask is not None:
-            clip_limit = cfg.continuity_clip
+            clip_limit = mid_price * cfg.continuity_clip_bps / BPS
             bid_move = _clip(bid_price - self._prev_bid, -clip_limit, clip_limit)
             ask_move = _clip(ask_price - self._prev_ask, -clip_limit, clip_limit)
             bid_price = self._prev_bid + bid_move

@@ -44,8 +44,16 @@ class EVConfig:
     min_half_spread_mult: float = 0.25
     max_half_spread_mult: float = 3.0
     num_points: int = 20
-    min_spread_bps: float = 0.1     # relative floor on the final spread
+    # Anti-collapse floor only. Must stay below the real market spread
+    # (~0.0016 bps on BTCUSDT) x min_half_spread_mult, or it overrides
+    # the EV decision and pins quotes wider than the optimizer chose.
+    min_spread_bps: float = 0.001
     fallback_spread_bps: float = 1.0  # market spread proxy when no book
+    # Ceiling on the live-spread anchor, in bps of mid. The observed
+    # spread spikes 100-1000x when the touch is transiently consumed
+    # mid-event; anchoring the candidate band to those spikes parks
+    # quotes dollars away where only toxic sweeps reach them.
+    max_anchor_spread_bps: float = 0.05
     # Risk widening: push the candidate band outward (in market-spread
     # units) as inventory and volatility grow, to resist adverse selection.
     inv_risk_factor: float = 2.0    # widen by this × |inventory_norm|
@@ -62,6 +70,8 @@ class EVConfig:
             raise ValueError("min_spread_bps must be positive")
         if self.fallback_spread_bps <= 0:
             raise ValueError("fallback_spread_bps must be positive")
+        if self.max_anchor_spread_bps <= 0:
+            raise ValueError("max_anchor_spread_bps must be positive")
         if self.inv_risk_factor < 0:
             raise ValueError("inv_risk_factor must be non-negative")
         if self.vol_risk_factor < 0:
@@ -162,6 +172,15 @@ class EVMaker:
             best_bid_price = c - min_abs_spread / 2.0
             best_ask_price = c + min_abs_spread / 2.0
 
+        # Never quote through the touch: a bid at/above the best ask
+        # (or ask at/below the best bid) is a marketable order, not a
+        # resting quote. min()/max() only widen a floored pair, so the
+        # clamp cannot re-cross bid and ask.
+        if bids and asks and asks[0][0] > bids[0][0]:
+            guard = min_abs_spread / 2.0
+            best_bid_price = min(best_bid_price, asks[0][0] - guard)
+            best_ask_price = max(best_ask_price, bids[0][0] + guard)
+
         return (
             Quote(price=best_bid_price, size=bid_size),
             Quote(price=best_ask_price, size=ask_size),
@@ -173,9 +192,10 @@ class EVMaker:
         bids: Optional[List[Tuple[float, float]]],
         asks: Optional[List[Tuple[float, float]]],
     ) -> float:
-        """Live touch spread from depth, or a relative fallback."""
+        """Live touch spread from depth (capped), or a relative fallback."""
+        cap = mid_price * self.config.max_anchor_spread_bps / BPS
         if bids and asks:
             spread = asks[0][0] - bids[0][0]
             if spread > 0:
-                return spread
-        return mid_price * self.config.fallback_spread_bps / BPS
+                return min(spread, cap)
+        return min(mid_price * self.config.fallback_spread_bps / BPS, cap)
