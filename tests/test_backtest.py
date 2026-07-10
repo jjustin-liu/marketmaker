@@ -460,3 +460,37 @@ def test_resolve_fill_mode_trades_arg_beats_sibling(tmp_path) -> None:
     mode, trades_path = resolve_fill_mode(None, depth, explicit)
     assert mode == "trades"
     assert trades_path == explicit
+
+
+def test_markout_horizon_unaffected_by_crossed_skips() -> None:
+    # Regression: fills recorded the raw diff index while mid_after indexes
+    # processed mids only, so every skipped (crossed) row stretched the
+    # markout horizon — turning "50 ticks later" into minutes and poisoning
+    # adverse_selection for direction-imbalanced fill sets.
+    class _PinnedQuotes:
+        def quote_prices(self, *args, **kwargs):
+            return Quote(price=99.6, size=0.1), Quote(price=200.0, size=0.1)
+
+    diffs = [
+        Diff(0, Side.BUY, 99.0, 5.0),    # no mid yet (no ask)
+        Diff(0, Side.SELL, 101.0, 5.0),  # mid 100.0        -> pos 0
+    ]
+    for _ in range(3):  # crossed noise: each pair = 1 skip + 1 processed row
+        diffs.append(Diff(1, Side.BUY, 102.0, 1.0))   # crossed -> skipped
+        diffs.append(Diff(1, Side.BUY, 102.0, 0.0))   # mid 100 -> pos 1,2,3
+    diffs.append(Diff(2, Side.SELL, 99.2, 1.0))  # mid 99.1 -> pos 4, bid fills
+    diffs.append(Diff(3, Side.SELL, 99.2, 0.0))  # mid 100.0 -> pos 5
+    diffs.append(Diff(4, Side.SELL, 99.4, 1.0))  # mid 99.2 -> pos 6
+
+    eng = BacktestEngine(
+        strategy=_PinnedQuotes(), refresh_every=1, markout_lookahead=2,
+        use_inventory=False,
+    )
+    res = eng.run(diffs)
+
+    assert eng.crossed_skips == 3
+    assert eng.fills[0].side == "buy"
+    assert eng.fills[0].mid_at_fill == pytest.approx(99.1)
+    # markout horizon = 2 processed mids after the fill at pos 4 -> pos 6
+    # (99.2), NOT raw-diff-index 8 + 2 which falls off the end (None).
+    assert res.adverse_selection == pytest.approx(99.2 - 99.1)

@@ -18,6 +18,7 @@ data/*.parquet
 data/raw/
 data/models/*.joblib
 data/backtest_results.csv
+data/backtest_*.csv
 data/fills.log
 .DS_Store
 .idea/

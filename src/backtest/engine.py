@@ -165,15 +165,19 @@ class BacktestEngine:
             self._volatility = self.vol_calc.update(mid)
 
             fills_before = len(self.fills)
+            # Markout must be measured in processed-mid positions, not raw
+            # diff indices — skipped rows (snapshot/crossed) would otherwise
+            # stretch the lookahead horizon by the cumulative skip count.
+            mid_idx = len(all_mids) - 1
             if self.fill_mode == "trades":
                 while (trade_idx < len(trade_list)
                        and trade_list[trade_idx].timestamp <= diff.timestamp):
                     self._maybe_fill_trade(trade_list[trade_idx], mid,
-                                           mids_at_fill_index, i)
+                                           mids_at_fill_index, mid_idx)
                     trade_idx += 1
             else:
                 self._maybe_fill(diff.timestamp, best_bid, best_ask, mid,
-                                 mids_at_fill_index, i)
+                                 mids_at_fill_index, mid_idx)
             new_fill = len(self.fills) > fills_before
 
             if i % self.refresh_every == 0:
@@ -216,30 +220,30 @@ class BacktestEngine:
         best_ask: float,
         mid: float,
         fill_indices: List[int],
-        i: int,
+        mid_idx: int,
     ) -> None:
         if self.fill_mode == "queue":
-            self._maybe_fill_queue(ts, best_bid, best_ask, mid, fill_indices, i)
+            self._maybe_fill_queue(ts, best_bid, best_ask, mid, fill_indices, mid_idx)
         else:
-            self._maybe_fill_strict(ts, best_bid, best_ask, mid, fill_indices, i)
+            self._maybe_fill_strict(ts, best_bid, best_ask, mid, fill_indices, mid_idx)
 
     def _maybe_fill_strict(
         self, ts: int, best_bid: float, best_ask: float, mid: float,
-        fill_indices: List[int], i: int,
+        fill_indices: List[int], mid_idx: int,
     ) -> None:
         """Worst-case queue: fill only when the market sweeps past our price."""
         if self.open_bid is not None and best_ask < self.open_bid.price:
             self._book_fill("buy", ts, mid, self.open_bid.price,
-                            self.open_bid.size, fill_indices, i)
+                            self.open_bid.size, fill_indices, mid_idx)
             self.open_bid = None
         if self.open_ask is not None and best_bid > self.open_ask.price:
             self._book_fill("sell", ts, mid, self.open_ask.price,
-                            self.open_ask.size, fill_indices, i)
+                            self.open_ask.size, fill_indices, mid_idx)
             self.open_ask = None
 
     def _maybe_fill_queue(
         self, ts: int, best_bid: float, best_ask: float, mid: float,
-        fill_indices: List[int], i: int,
+        fill_indices: List[int], mid_idx: int,
     ) -> None:
         """Depth-only flow proxy: fill on a touch (opposite best reaches our
         price), or — when we rest on a real level — as the queue ahead of us
@@ -257,7 +261,7 @@ class BacktestEngine:
                 filled = self._bid_queue <= 1e-12
             if filled:
                 self._book_fill("buy", ts, mid, pb, self.open_bid.size,
-                                fill_indices, i)
+                                fill_indices, mid_idx)
                 self.open_bid = None
         if self.open_ask is not None:
             pa = self.open_ask.price
@@ -271,11 +275,11 @@ class BacktestEngine:
                 filled = self._ask_queue <= 1e-12
             if filled:
                 self._book_fill("sell", ts, mid, pa, self.open_ask.size,
-                                fill_indices, i)
+                                fill_indices, mid_idx)
                 self.open_ask = None
 
     def _maybe_fill_trade(
-        self, trade: Trade, mid: float, fill_indices: List[int], i: int,
+        self, trade: Trade, mid: float, fill_indices: List[int], mid_idx: int,
     ) -> None:
         """Fill a resting quote when a trade prints at/through its price.
 
@@ -287,23 +291,23 @@ class BacktestEngine:
         if (self.open_bid is not None and trade.side == "sell"
                 and trade.price <= self.open_bid.price):
             self._book_fill("buy", trade.timestamp, mid, self.open_bid.price,
-                            self.open_bid.size, fill_indices, i)
+                            self.open_bid.size, fill_indices, mid_idx)
             self.open_bid = None
         if (self.open_ask is not None and trade.side == "buy"
                 and trade.price >= self.open_ask.price):
             self._book_fill("sell", trade.timestamp, mid, self.open_ask.price,
-                            self.open_ask.size, fill_indices, i)
+                            self.open_ask.size, fill_indices, mid_idx)
             self.open_ask = None
 
     def _book_fill(
         self, side: str, ts: int, mid: float, price: float, size: float,
-        fill_indices: List[int], i: int,
+        fill_indices: List[int], mid_idx: int,
     ) -> None:
         """Record a fill and update inventory, cash, and fees."""
         notional = price * size
         self.fills.append(Fill(timestamp=ts, side=side, price=price,
                                size=size, mid_at_fill=mid))
-        fill_indices.append(i)
+        fill_indices.append(mid_idx)
         if side == "buy":
             self.inventory += size
             self.cash -= notional
