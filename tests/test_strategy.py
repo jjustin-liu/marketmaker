@@ -389,3 +389,36 @@ def test_ev_anchor_capped_on_transient_wide_spread() -> None:
     )
     max_half = 3.0 * cap  # band top at max_half_spread_mult x capped anchor
     assert (ask.price - bid.price) / 2.0 <= max_half + 1e-9
+
+
+def test_ev_edge_model_overrides_geometric_edge() -> None:
+    # Flat P with geometric edge picks the widest candidate (see
+    # test_ev_constant_prob_picks_widest). A conditional-edge model that
+    # says distance is toxic must flip the argmax to the tightest.
+    class _FlatP:
+        def predict(self, bids, asks, price, size, side):
+            return 0.5
+
+    class _TightEdge:
+        def predict(self, bids, asks, price, size, side):
+            mid = (bids[0][0] + asks[0][0]) / 2.0
+            return 0.01 - abs(price - mid)
+
+    mid = 100_000.0
+    ev = EVMaker(
+        inventory_skew=InventorySkew(),
+        size_calculator=SizeCalculator(),
+        fill_model=_FlatP(),
+        edge_model=_TightEdge(),
+        config=EVConfig(
+            min_half_spread_mult=0.25, max_half_spread_mult=3.0,
+            num_points=10, inv_risk_factor=0.0, vol_risk_factor=0.0,
+        ),
+    )
+    bid, ask = ev.quote_prices(
+        mid_price=mid, inventory=0.0,
+        bids=[(mid - 0.05, 1.0)], asks=[(mid + 0.05, 1.0)],
+    )
+    # tightest candidate = min_half_spread_mult (0.25) x 0.10 spread
+    assert (mid - bid.price) == pytest.approx(0.25 * 0.10)
+    assert (ask.price - mid) == pytest.approx(0.25 * 0.10)

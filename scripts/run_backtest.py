@@ -140,6 +140,9 @@ def main() -> None:
     parser.add_argument("--model", type=Path,
                         default=Path("data/models/fill_prob.joblib"),
                         help="Path to fill_prob.joblib for EVMaker.")
+    parser.add_argument("--edge-model", type=Path, default=None,
+                        help="Optional edge.joblib; EV becomes P(fill) x "
+                             "expected conditional edge instead of P x h.")
     parser.add_argument("--max-diffs", type=int, default=None,
                         help="Cap diffs replayed (fast iteration on big files).")
     parser.add_argument("--trades", type=Path, default=None,
@@ -198,12 +201,21 @@ def main() -> None:
         except Exception as exc:
             logger.warning("Could not load fill model: %s", exc)
 
+    edge_model = None
+    if args.edge_model is not None:
+        from src.models.edge_model import EdgeModel
+        edge_model = EdgeModel.load(args.edge_model)
+        logger.info("Edge model loaded from %s (R2 %.3f) — "
+                    "EV = P(fill) x conditional edge",
+                    args.edge_model, edge_model.r2)
+
     logger.info("Running EVMaker ...")
     ev_engine = BacktestEngine(
         strategy=EVMaker(
             inventory_skew=InventorySkew(),
             size_calculator=SizeCalculator(),
             fill_model=fill_model,
+            edge_model=edge_model,
         ),
         use_inventory=True,
         fee_bps=args.fee_bps,

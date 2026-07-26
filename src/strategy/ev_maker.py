@@ -9,6 +9,12 @@ a tight quote that fills often can beat a wide quote that rarely fills.
 A relative floor keeps the final pair from collapsing on a zero-width
 book. Because both sides are centre ± h with h > 0, the quote can never
 invert or cross.
+
+With an edge_model, the geometric edge h is replaced by the model's
+expected *conditional* edge — what a fill at that price is worth after
+the adverse move that tends to follow it. P(fill) and adverse selection
+are positively correlated (fills at distance are the toxic ones);
+EV = P * h ignores that and drifts wide, EV = P * edge prices it in.
 """
 
 from __future__ import annotations
@@ -98,10 +104,14 @@ class EVMaker:
         size_calculator: SizeCalculator,
         fill_model: Optional[FillModel] = None,
         config: Optional[EVConfig] = None,
+        edge_model: Optional[FillModel] = None,
     ) -> None:
         self.inventory_skew = inventory_skew
         self.size_calculator = size_calculator
         self.fill_model = fill_model
+        # Same predict() shape as FillModel, but returns the expected
+        # signed edge in dollars conditional on the quote filling.
+        self.edge_model = edge_model
         self.config = config or EVConfig()
 
     def quote_prices(
@@ -157,9 +167,20 @@ class EVMaker:
                 p_bid = bid_probability if bid_probability is not None else 0.5
                 p_ask = ask_probability if ask_probability is not None else 0.5
 
-            # Edge captured if filled = distance from fair centre = h.
-            ev_bid = p_bid * h
-            ev_ask = p_ask * h
+            # Edge captured if filled: model-estimated conditional edge
+            # when available, else the geometric distance from centre.
+            if self.edge_model is not None and bids and asks:
+                edge_bid = self.edge_model.predict(
+                    bids, asks, bid_candidate, bid_size, "buy",
+                )
+                edge_ask = self.edge_model.predict(
+                    bids, asks, ask_candidate, ask_size, "sell",
+                )
+            else:
+                edge_bid = h
+                edge_ask = h
+            ev_bid = p_bid * edge_bid
+            ev_ask = p_ask * edge_ask
             if ev_bid > best_bid_ev:
                 best_bid_ev, best_bid_price = ev_bid, bid_candidate
             if ev_ask > best_ask_ev:
