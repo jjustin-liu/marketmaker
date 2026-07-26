@@ -1,0 +1,39 @@
+# Continuous (24/7) live/paper stack: Redis + feed + paper trader, all with
+# auto-restart. Layer this on top of the monitoring stack:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.live.yml up -d
+#
+# The feed decodes the Binance WebSocket into the Redis book; the paper
+# service runs the quoting loop against it and serves Prometheus metrics.
+# restart: unless-stopped keeps both alive across crashes and reboots.
+services:
+  feed:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: mm_feed
+    command: ["python", "-m", "scripts.run_feed", "--forever"]
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  paper:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: mm_paper
+    command: ["python", "-m", "src.cli", "live"]
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - MM_FEE_BPS=10
+      - MM_METRICS_PORT=8000
+    ports:
+      - "8000:8000"    # Prometheus scrape target
+    depends_on:
+      - redis
+      - feed
+    restart: unless-stopped
