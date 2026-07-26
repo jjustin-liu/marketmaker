@@ -20,6 +20,7 @@ dependencies = [
     "pybind11>=2.11",
     "prometheus-client>=0.19",
     "python-binance>=1.0.19",
+    "sortedcontainers>=2.4",
 ]
 
 [project.optional-dependencies]

@@ -132,6 +132,10 @@ def build_fills_dataset(
         if not future_best_asks or not future_best_bids:
             continue
 
+        # Realized conditional edge: what a fill at this price is worth
+        # by the end of the lookahead window. Signed per side.
+        mid_horizon = mids[i + lookahead]
+
         for _ in range(SAMPLES_PER_TICK // 2):
             offset = float(
                 np.exp(rng.uniform(np.log(min_offset), np.log(max_offset)))
@@ -140,6 +144,11 @@ def build_fills_dataset(
                 ("buy", mid_i - offset),
                 ("sell", mid_i + offset),
             ):
+                if np.isfinite(mid_horizon):
+                    edge = (mid_horizon - candidate if side == "buy"
+                            else candidate - mid_horizon)
+                else:
+                    edge = float("nan")
                 rows.append({
                     "bids": [list(x) for x in bids],
                     "asks": [list(x) for x in asks],
@@ -150,6 +159,7 @@ def build_fills_dataset(
                         mid_i, candidate, side,
                         future_best_asks, future_best_bids,
                     ),
+                    "_edge": edge,
                 })
 
     df = pd.DataFrame(rows)
@@ -200,10 +210,62 @@ def train_from_labeled(df: pd.DataFrame) -> Tuple[FillProbabilityModel, float]:
     return FillProbabilityModel(model=model, scaler=scaler, auc=auc), auc
 
 
+def train_edge_from_labeled(df: pd.DataFrame) -> Tuple["EdgeModel", float]:
+    """Fit the conditional-edge regressor on FILLED candidates only.
+
+    Label is the realized signed edge (_edge) of rows with _label == 1:
+    the value of the fill after the adverse move that tends to follow
+    it. Returns (EdgeModel, test R^2).
+    """
+    from sklearn.linear_model import Ridge
+    from sklearn.metrics import r2_score
+    from sklearn.model_selection import train_test_split
+    from sklearn.preprocessing import StandardScaler
+
+    from src.models.edge_model import EdgeModel
+
+    filled = df[(df["_label"] == 1) & np.isfinite(df["_edge"])]
+    if len(filled) < 100:
+        raise RuntimeError(
+            f"only {len(filled)} filled candidates — too few to fit the "
+            "edge model; increase --max-ticks"
+        )
+
+    X_rows: List[np.ndarray] = []
+    y_rows: List[float] = []
+    for _, row in filled.iterrows():
+        bids = [tuple(x) for x in row["bids"]]
+        asks = [tuple(x) for x in row["asks"]]
+        feats = FillProbabilityModel.extract_features(
+            bids, asks, float(row["price"]), float(row["size"]),
+            str(row["side"]),
+        )
+        X_rows.append(feats.to_array())
+        y_rows.append(float(row["_edge"]))
+
+    X = np.vstack(X_rows)
+    y = np.array(y_rows, dtype=np.float64)
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X, y, test_size=0.2, random_state=42,
+    )
+    scaler = StandardScaler()
+    X_tr_s = scaler.fit_transform(X_tr)
+    X_te_s = scaler.transform(X_te)
+    model = Ridge(alpha=1.0)
+    model.fit(X_tr_s, y_tr)
+    r2 = float(r2_score(y_te, model.predict(X_te_s)))
+    logger.info("edge model: %d filled rows, mean edge %.4f, test R2 %.4f",
+                len(filled), float(y.mean()), r2)
+    return EdgeModel(model=model, scaler=scaler, r2=r2), r2
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--out", type=Path, default=DEFAULT_MODEL_PATH)
+    parser.add_argument("--edge-out", type=Path, default=None,
+                        help="also fit the conditional-edge model on filled "
+                             "candidates and save it here")
     parser.add_argument("--lookahead", type=int, default=LOOKAHEAD_DEFAULT)
     parser.add_argument("--max-ticks", type=int, default=50_000)
     parser.add_argument(
@@ -225,6 +287,11 @@ def main() -> None:
     logger.info("test AUC = %.4f", auc)
     out = model.save(args.out)
     logger.info("saved model to %s", out)
+
+    if args.edge_out is not None:
+        edge_model, _ = train_edge_from_labeled(df)
+        edge_path = edge_model.save(args.edge_out)
+        logger.info("saved edge model to %s", edge_path)
 
 
 if __name__ == "__main__":

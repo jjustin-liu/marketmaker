@@ -13,6 +13,8 @@ from typing import Any, Deque, Dict, List, Optional
 
 DEPTH_LEVELS_PUBLISHED = 20
 TRADE_RINGBUFFER_SIZE = 100
+TRADE_STREAM_MAXLEN = 5000
+TRADE_STREAM_KEY = "trades:stream"
 BPS_PER_UNIT = 10000.0
 
 
@@ -55,7 +57,10 @@ class RedisWriter:
                      timestamp: int) -> None:
         """Add a trade to the ringbuffer and publish trades:recent.
 
-        side is the aggressor side: 'buy' or 'sell'.
+        Also writes to the trades:stream Redis stream so downstream
+        consumers (e.g. queue-aware paper fill simulator) can read each
+        trade exactly once via XREAD since last seen ID. side is the
+        aggressor side: 'buy' or 'sell'.
         """
         if side not in ("buy", "sell"):
             raise ValueError(f"side must be 'buy' or 'sell', got {side!r}")
@@ -66,6 +71,17 @@ class RedisWriter:
             "timestamp": timestamp,
         })
         self._redis.set("trades:recent", json.dumps(list(self._trades)))
+        self._redis.xadd(
+            TRADE_STREAM_KEY,
+            {
+                "price": str(price),
+                "qty": str(qty),
+                "side": side,
+                "timestamp": str(timestamp),
+            },
+            maxlen=TRADE_STREAM_MAXLEN,
+            approximate=True,
+        )
 
     @property
     def recent_trades(self) -> List[Dict[str, Any]]:
