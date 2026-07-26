@@ -11,6 +11,7 @@ from src.backtest.engine import (
     Diff,
     load_diffs_from_parquet,
     load_trades_from_parquet,
+    stream_diffs_from_parquets,
 )
 from src.backtest.metrics import (
     Fill,
@@ -494,3 +495,39 @@ def test_markout_horizon_unaffected_by_crossed_skips() -> None:
     # markout horizon = 2 processed mids after the fill at pos 4 -> pos 6
     # (99.2), NOT raw-diff-index 8 + 2 which falls off the end (None).
     assert res.adverse_selection == pytest.approx(99.2 - 99.1)
+
+
+def _write_depth(path: Path, prices: List[float]) -> None:
+    """Write a tiny valid depth parquet: one bid+ask pair per price."""
+    rows = []
+    for i, p in enumerate(prices):
+        rows.append({"timestamp": i, "side": "buy", "price": p - 0.5,
+                     "qty": 1.0, "is_snapshot": False})
+        rows.append({"timestamp": i, "side": "sell", "price": p + 0.5,
+                     "qty": 1.0, "is_snapshot": False})
+    pd.DataFrame(rows).to_parquet(path, index=False)
+
+
+def test_stream_diffs_across_shards_preserves_order(tmp_path: Path) -> None:
+    a = tmp_path / "shard_a.parquet"
+    b = tmp_path / "shard_b.parquet"
+    _write_depth(a, [100.0, 101.0])
+    _write_depth(b, [102.0, 103.0])
+
+    streamed = list(stream_diffs_from_parquets([a, b]))
+    concat = load_diffs_from_parquet(a) + load_diffs_from_parquet(b)
+
+    assert len(streamed) == len(concat)
+    assert [(d.timestamp, d.side, d.price) for d in streamed] == \
+           [(d.timestamp, d.side, d.price) for d in concat]
+
+
+def test_engine_runs_on_streamed_shards(tmp_path: Path) -> None:
+    a = tmp_path / "a.parquet"
+    b = tmp_path / "b.parquet"
+    _write_depth(a, [100.0, 100.1, 100.2])
+    _write_depth(b, [100.3, 100.4, 100.5])
+
+    eng = BacktestEngine(strategy=NaiveMaker(), use_inventory=False)
+    res = eng.run(stream_diffs_from_parquets([a, b]))
+    assert res.num_quotes > 0

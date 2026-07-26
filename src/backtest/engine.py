@@ -12,7 +12,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional, Protocol, Tuple
+from typing import Callable, Iterable, Iterator, List, Optional, Protocol, Tuple
 
 import pandas as pd
 
@@ -133,6 +133,12 @@ class BacktestEngine:
         trade_list = sorted(trades, key=lambda t: t.timestamp) if trades else []
         trade_idx = 0
 
+        # Optional per-tick L1 hook: strategies with stateful signals (e.g.
+        # OFI) need every book update, not just refresh ticks. Resolved once;
+        # strategies without it are unaffected.
+        observe_l1 = getattr(self.strategy, "observe_l1", None)
+        reset_signal = getattr(self.strategy, "reset", None)
+
         for i, diff in enumerate(diffs):
             # Epoch boundary: first snapshot row after live diffs → reset book
             if diff.is_snapshot and not _in_snapshot:
@@ -140,6 +146,8 @@ class BacktestEngine:
                 self.vol_calc.reset()
                 self.open_bid = None
                 self.open_ask = None
+                if reset_signal is not None:
+                    reset_signal()
                 _in_snapshot = True
             elif not diff.is_snapshot:
                 _in_snapshot = False
@@ -163,6 +171,12 @@ class BacktestEngine:
             mid = (best_bid + best_ask) / 2.0
             all_mids.append(mid)
             self._volatility = self.vol_calc.update(mid)
+
+            if observe_l1 is not None:
+                observe_l1(
+                    best_bid, self.book.qty_at(Side.BUY, best_bid),
+                    best_ask, self.book.qty_at(Side.SELL, best_ask),
+                )
 
             fills_before = len(self.fills)
             # Markout must be measured in processed-mid positions, not raw
@@ -415,6 +429,23 @@ def load_diffs_from_parquet(path: Path, skip_rows: int = 0) -> List[Diff]:
         )
         for i in range(len(df))
     ]
+
+
+def stream_diffs_from_parquets(
+    paths: Iterable[Path],
+) -> Iterator[Diff]:
+    """Yield diffs across many parquet shards in order, one shard in memory.
+
+    BacktestEngine.run accepts any Iterable[Diff], so feeding this
+    generator lets the engine replay a dataset far larger than RAM: only
+    one shard is materialized at a time, then released before the next.
+    This is how the pipeline scales to TB-scale partitioned L2 data —
+    total size is bounded by disk and time, not memory. Shards must be
+    passed in chronological order.
+    """
+    for path in paths:
+        for diff in load_diffs_from_parquet(path):
+            yield diff
 
 
 def load_trades_from_parquet(path: Path) -> List[Trade]:
