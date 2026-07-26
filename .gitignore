@@ -16,10 +16,15 @@ dist/
 htmlcov/
 data/*.parquet
 data/raw/
+data/synthetic/
+data/l2_shards/
+data/l2_shards_synth/
+data/tardis/
 data/models/*.joblib
 data/backtest_results.csv
 data/backtest_*.csv
 data/fills.log
+reports/
 .DS_Store
 .idea/
 .vscode/
